@@ -22,6 +22,11 @@ _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 _KL_EPS = 1e-10
 _INDEXER_RATIO = 1
 _INDEXER_SOFTMAX_SCALE = 1.0
+_TOPK_WRAPPER_MAX_SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
+_TOPK_WRAPPER_SCRATCH_INT32_FACTOR = 2
+_TOPK_WRAPPER_ROW_ALIGNMENT = 512
+_INDEXER_SCORE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
+_INDEXER_SCORE_CHUNK_ROW_ALIGNMENT = 512
 
 
 def _use_fused_dsa_kernels(config: TransformerConfig) -> bool:
@@ -128,8 +133,7 @@ def _ensure_flash_mla() -> None:
 
     FlashMLA ships ``flash_mla_sparse_fwd`` with a multi-head-KV signature;
     :func:`_dsa_fwd_flash_mla` below adapts the DSA-shape inputs and pads
-    ``topk`` to the alignment expected by
-    FlashMLA's Blackwell kernel.
+    ``topk`` to the alignment expected by the active FlashMLA sparse-prefill kernel.
     """
     global _flash_mla_sparse_fwd
     if _flash_mla_sparse_fwd is not None:
@@ -147,13 +151,11 @@ def _ensure_flash_mla() -> None:
 
 
 def _get_topk_alignment() -> int:
-    """Minimum top-K alignment required by the Blackwell FlashMLA kernel."""
+    """Minimum top-K alignment required by the active FlashMLA sparse-prefill kernel."""
     sm = torch.cuda.get_device_capability()
-    if sm[0] >= 10:
+    if sm[0] >= 9:
         return 512
-    raise RuntimeError(
-        f"cudnn fused DSA requires SM100+ (Blackwell or later), got SM{sm[0]}{sm[1]}."
-    )
+    raise RuntimeError(f"cudnn fused DSA requires SM90+ (Hopper or later), got SM{sm[0]}{sm[1]}.")
 
 
 def _get_head_padding(num_heads: int) -> int:
@@ -167,7 +169,7 @@ def _get_head_padding(num_heads: int) -> int:
         head_align = 64
     else:
         raise RuntimeError(
-            f"cudnn fused DSA requires SM100+ (Blackwell or later), got SM{sm[0]}{sm[1]}."
+            f"cudnn fused DSA requires SM90+ (Hopper or later), got SM{sm[0]}{sm[1]}."
         )
 
     if num_heads % head_align == 0:
@@ -177,6 +179,115 @@ def _get_head_padding(num_heads: int) -> int:
     raise RuntimeError(
         "FlashMLA sparse prefill requires the local query-head count to divide "
         f"{head_align}, got h_q={num_heads}."
+    )
+
+
+def _indexer_top_k_wrapper_chunked(
+    scores_flat: Tensor, seq_lens: Tensor, topk_k: int, return_topk_scores: bool
+) -> dict:
+    """Run cuDNN top-k in row chunks to bound wrapper scratch allocation."""
+    n_rows, sk = scores_flat.shape
+    scratch_bytes_per_row = max(1, sk) * torch.iinfo(torch.int32).bits // 8
+    scratch_bytes_per_row *= _TOPK_WRAPPER_SCRATCH_INT32_FACTOR
+    chunk_rows = max(1, _TOPK_WRAPPER_MAX_SCRATCH_BYTES // scratch_bytes_per_row)
+    row_alignment = _TOPK_WRAPPER_ROW_ALIGNMENT
+    if chunk_rows > row_alignment:
+        chunk_rows = (chunk_rows // row_alignment) * row_alignment
+    else:
+        chunk_rows = row_alignment
+    chunk_rows = min(n_rows, chunk_rows)
+
+    if chunk_rows >= n_rows:
+        return _DSA.indexer_top_k_wrapper(
+            scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=return_topk_scores
+        )
+
+    indices_chunks = []
+    values_chunks = [] if return_topk_scores else None
+    for row_start in range(0, n_rows, chunk_rows):
+        row_end = min(row_start + chunk_rows, n_rows)
+        tk_result = _DSA.indexer_top_k_wrapper(
+            scores_flat[row_start:row_end].contiguous(),
+            seq_lens[row_start:row_end].contiguous(),
+            top_k=topk_k,
+            next_n=1,
+            return_val=return_topk_scores,
+        )
+        indices_chunks.append(tk_result["indices"])
+        if return_topk_scores:
+            values = tk_result["values"]
+            if values is None:
+                raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
+            values_chunks.append(values)
+
+    return {
+        "indices": torch.cat(indices_chunks, dim=0),
+        "values": torch.cat(values_chunks, dim=0) if return_topk_scores else None,
+    }
+
+
+def _indexer_score_chunk_rows(b: int, sq: int, sk: int) -> int:
+    score_bytes_per_seq_row = max(1, b) * max(1, sk) * torch.finfo(torch.float32).bits // 8
+    chunk_rows = max(1, _INDEXER_SCORE_CHUNK_MAX_BYTES // score_bytes_per_seq_row)
+    row_alignment = _INDEXER_SCORE_CHUNK_ROW_ALIGNMENT
+    if chunk_rows > row_alignment:
+        chunk_rows = (chunk_rows // row_alignment) * row_alignment
+    else:
+        chunk_rows = row_alignment
+    return min(sq, max(1, chunk_rows))
+
+
+def _indexer_topk_from_score_chunks(
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    w_bsh: Tensor,
+    seq_lens: Tensor,
+    topk_k: int,
+    return_topk_scores: bool,
+    *,
+    starts: Optional[Tensor] = None,
+    ends: Optional[Tensor] = None,
+    key_positions_i64: Optional[Tensor] = None,
+    indexer_ratio: int = _INDEXER_RATIO,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    b, sq, _idx_nh, _idx_hd = q_bshd.shape
+    sk = k_bshd.size(1)
+    chunk_rows = _indexer_score_chunk_rows(b, sq, sk)
+    seq_lens_b = seq_lens.view(b, sq)
+    indices_chunks = []
+    values_chunks = [] if return_topk_scores else None
+
+    for row_start in range(0, sq, chunk_rows):
+        row_end = min(row_start + chunk_rows, sq)
+        scores_chunk = _DSA.indexer_forward_wrapper(
+            q_bshd[:, row_start:row_end].contiguous(),
+            k_bshd,
+            w_bsh[:, row_start:row_end].contiguous(),
+            ratio=indexer_ratio,
+            sm_scale=_INDEXER_SOFTMAX_SCALE,
+        )["scores"]
+        if starts is not None:
+            scores_chunk = dsa_masking.apply_starts_ends_mask_to_scores(
+                scores_chunk, starts[row_start:row_end], ends[row_start:row_end], key_positions_i64
+            )
+
+        scores_flat = scores_chunk.reshape(b * (row_end - row_start), sk).contiguous()
+        chunk_seq_lens = seq_lens_b[:, row_start:row_end].reshape(-1).contiguous()
+        tk_result = _indexer_top_k_wrapper_chunked(
+            scores_flat, chunk_seq_lens, topk_k=topk_k, return_topk_scores=return_topk_scores
+        )
+        del scores_flat, scores_chunk
+
+        indices_chunks.append(tk_result["indices"].view(b, row_end - row_start, topk_k))
+        if return_topk_scores:
+            values = tk_result["values"]
+            if values is None:
+                raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
+            values_chunks.append(values.view(b, row_end - row_start, topk_k))
+
+    return (
+        torch.cat(indices_chunks, dim=1),
+        torch.cat(values_chunks, dim=1) if return_topk_scores else None,
     )
 
 
@@ -355,6 +466,9 @@ def _indexer_topk_bshd(
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bsd.shape[1]
     device = q_bshd.device
+    topk_k = min(topk, sk)
+    topk_indices = None
+    topk_scores = None
 
     starts = ends = key_positions_i64 = None
     if varlen_starts is not None:
@@ -374,13 +488,18 @@ def _indexer_topk_bshd(
     k_bshd = k_bsd.unsqueeze(2)  # (b, sk, 1, idx_hd)
 
     if starts is None:
-        scores = _DSA.indexer_forward_wrapper(
-            q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO, sm_scale=_INDEXER_SOFTMAX_SCALE
-        )[
-            "scores"
-        ]  # (b, sq, sk) fp32, -inf on masked positions
         q_idx = torch.arange(sq, device=device)
         seq_lens = ((q_idx + 1) // _INDEXER_RATIO).clamp(max=sk).to(torch.int32).repeat(b)
+        if not return_scores:
+            topk_indices, topk_scores = _indexer_topk_from_score_chunks(
+                q_bshd, k_bshd, w_bsh, seq_lens, topk_k, return_topk_scores
+            )
+        else:
+            scores = _DSA.indexer_forward_wrapper(
+                q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO, sm_scale=_INDEXER_SOFTMAX_SCALE
+            )[
+                "scores"
+            ]  # (b, sq, sk) fp32, -inf on masked positions
     else:
         query_positions = (ends - 1).to(dtype=torch.int64)
         local_query_positions = torch.arange(sq, dtype=torch.int64, device=device)
@@ -407,31 +526,54 @@ def _indexer_topk_bshd(
             gather_positions = query_positions
             indexer_ratio = _INDEXER_RATIO
 
-        scores = _DSA.indexer_forward_wrapper(
-            q_for_scores, k_bshd, w_for_scores, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
-        )["scores"]
-        if gather_positions is not None:
-            scores = scores.index_select(1, gather_positions)
-        scores = dsa_masking.apply_starts_ends_mask_to_scores(
-            scores, starts, ends, key_positions_i64
-        )
         seq_lens = ends.clamp(max=sk).to(torch.int32).repeat(b)
+        if not return_scores and gather_positions is None:
+            topk_indices, topk_scores = _indexer_topk_from_score_chunks(
+                q_for_scores,
+                k_bshd,
+                w_for_scores,
+                seq_lens,
+                topk_k,
+                return_topk_scores,
+                starts=starts,
+                ends=ends,
+                key_positions_i64=key_positions_i64,
+                indexer_ratio=indexer_ratio,
+            )
+        else:
+            scores = _DSA.indexer_forward_wrapper(
+                q_for_scores,
+                k_bshd,
+                w_for_scores,
+                ratio=indexer_ratio,
+                sm_scale=_INDEXER_SOFTMAX_SCALE,
+            )["scores"]
+            if gather_positions is not None:
+                scores = scores.index_select(1, gather_positions)
+            scores = dsa_masking.apply_starts_ends_mask_to_scores(
+                scores, starts, ends, key_positions_i64
+            )
 
     # Top-K selection via the TRT-LLM CuTe-DSL radix kernel.
-    n_rows = b * sq
-    scores_flat = scores.reshape(n_rows, sk).contiguous()
+    if topk_indices is None:
+        n_rows = b * sq
+        scores_flat = scores.reshape(n_rows, sk).contiguous()
 
-    topk_k = min(topk, sk)
-    tk_result = _DSA.indexer_top_k_wrapper(
-        scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=return_topk_scores
-    )
-    topk_indices = tk_result["indices"].view(b, sq, topk_k)
-    topk_scores = None
+        tk_result = _indexer_top_k_wrapper_chunked(
+            scores_flat, seq_lens, topk_k=topk_k, return_topk_scores=return_topk_scores
+        )
+        del scores_flat
+        if not return_scores:
+            del scores
+        topk_indices = tk_result["indices"].view(b, sq, topk_k)
+        if return_topk_scores:
+            topk_scores = tk_result["values"]
+            if topk_scores is None:
+                raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
+            topk_scores = topk_scores.view(b, sq, topk_k)
+
     if return_topk_scores:
-        topk_scores = tk_result["values"]
-        if topk_scores is None:
-            raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
-        topk_scores = topk_scores.view(b, sq, topk_k).to(dtype=torch.float32)
+        topk_scores = topk_scores.to(dtype=torch.float32)
 
     if return_topk_scores:
         in_range = (topk_indices >= 0) & (topk_indices < sk)
@@ -561,9 +703,12 @@ def _pad_attn_target_heads(
 ) -> Tuple[Tensor, Tensor, int]:
     """Pad local query heads to cuDNN sparse-score-recompute MMA constraints."""
     actual_heads = q_attn_bshd.size(2)
-    padded_heads = max(
-        min_heads, ((actual_heads + head_multiple - 1) // head_multiple) * head_multiple
-    )
+    if q_attn_bshd.is_cuda:
+        padded_heads = _get_head_padding(actual_heads)
+    else:
+        padded_heads = max(
+            min_heads, ((actual_heads + head_multiple - 1) // head_multiple) * head_multiple
+        )
     if padded_heads == actual_heads:
         return q_attn_bshd, lse, actual_heads
 
