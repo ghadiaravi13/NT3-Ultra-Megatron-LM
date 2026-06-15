@@ -17,9 +17,11 @@ from megatron.core.transformer.experimental_attention_variant import dsa_layout,
 try:
     from megatron.core.transformer.experimental_attention_variant.ops.indexer import (
         lighting_indexer,
+        lighting_indexer_indices,
     )
 except (ImportError, OSError):
     lighting_indexer = None
+    lighting_indexer_indices = None
 
 try:
     from megatron.core.transformer.experimental_attention_variant.ops.sparse_mla import SparseMLA
@@ -81,6 +83,17 @@ def _sanitize_fused_topk_indices(
     return topk_indices.masked_fill(~valid, -1), valid
 
 
+def _sanitize_fused_topk_indices_(
+    topk_indices: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+) -> torch.Tensor:
+    """Mask fused indexer outputs in place and return the validity mask."""
+    starts_for_cmp = starts.to(device=topk_indices.device, dtype=topk_indices.dtype).unsqueeze(-1)
+    ends_for_cmp = ends.to(device=topk_indices.device, dtype=topk_indices.dtype).unsqueeze(-1)
+    valid = (topk_indices >= starts_for_cmp) & (topk_indices < ends_for_cmp)
+    topk_indices.masked_fill_(~valid, -1)
+    return valid
+
+
 def _sanitize_fused_topk_outputs(
     topk_indices: torch.Tensor,
     starts: torch.Tensor,
@@ -105,7 +118,7 @@ def fused_qk_topk_lighting(
     use_relu: bool = True,
 ) -> Optional[torch.Tensor]:
     """Run fused TileLang indexer and return top-k indices [b, sq, topk]."""
-    if lighting_indexer is None:
+    if lighting_indexer_indices is None:
         return None
     if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
         return None
@@ -116,36 +129,28 @@ def fused_qk_topk_lighting(
     starts = starts.contiguous()
     ends = ends.contiguous()
 
-    topk_out = None
+    topk_k = min(index_topk, k.size(0))
+    topk_out = torch.empty((b, sq, topk_k), dtype=torch.int32, device=q.device)
     for bi in range(b):
         index_q = q[:, bi].contiguous()
         index_k = k[:, bi].contiguous()
         index_w = weights[:, bi].float().contiguous()
         for start in range(0, sq, block_size):
             end = min(start + block_size, sq)
-            _, topk_indices = lighting_indexer(
+            topk_indices = lighting_indexer_indices(
                 index_q[start:end],
                 index_k,
                 index_w[start:end],
                 starts[start:end],
                 ends[start:end],
                 index_topk,
-                topk_indices=None,
                 use_relu=use_relu,
             )
-            topk_indices, _ = _sanitize_fused_topk_indices(
-                topk_indices=topk_indices, starts=starts[start:end], ends=ends[start:end]
+            _sanitize_fused_topk_indices_(
+                topk_indices, starts=starts[start:end], ends=ends[start:end]
             )
-            if topk_out is None:
-                topk_out = torch.empty(
-                    (b, sq, topk_indices.size(-1)),
-                    dtype=topk_indices.dtype,
-                    device=topk_indices.device,
-                )
             topk_out[bi, start:end].copy_(topk_indices)
 
-    if topk_out is None:
-        return None
     return topk_out
 
 
