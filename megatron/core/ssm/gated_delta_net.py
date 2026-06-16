@@ -145,11 +145,11 @@ class GatedDeltaNet(MegatronModule):
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
-        # A2A CP uses head-parallel layout: each CP rank handles a slice of
+        # Headwise CP uses head-parallel layout: each CP rank handles a slice of
         # heads. The static cp_size (== max dynamic cp_size) must evenly divide
         # the per-TP head counts so that every possible runtime cp_size also
-        # divides. All-gather CP keeps heads local and does not need this split.
-        if self.config.linear_cp_comm_type == "a2a":
+        # divides. Chunkwise CP keeps heads local and does not need this split.
+        if self.config.linear_cp_mode == "headwise":
             num_key_heads_per_tp = self.num_key_heads // self.tp_size
             num_value_heads_per_tp = self.num_value_heads // self.tp_size
             assert num_key_heads_per_tp % self.cp_size == 0, (
@@ -269,7 +269,7 @@ class GatedDeltaNet(MegatronModule):
         # cu_seqlens is fully determined by the (static) global sequence length
         # and batch size, so we cache the (cu_seqlens, cp_context) pair keyed on
         # both values.
-        self._all_gather_cp_context_cache = {}
+        self._chunkwise_cp_context_cache = {}
 
         self.reset_parameters()
 
@@ -327,34 +327,34 @@ class GatedDeltaNet(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        # Route the CP group to either the A2A (Ulysses-style) path or the all-gather
-        # CP path according to config.linear_cp_comm_type. The two paths
+        # Route the CP group to either the headwise (Ulysses-style) path or the
+        # chunkwise CP path according to config.linear_cp_mode. The two paths
         # are mutually exclusive — whichever one is active owns the full CP
         # group, and the other is given a size-1 group (None). The unused-path
         # helpers already treat a None group as size 1, avoiding a costly and
         # CUDA-graph-unsafe `torch.distributed.new_group` on every forward.
         base_cp_group = pg_collection.cp if pg_collection is not None else self.pg_collection.cp
         cp_group = resolve_cp_group(base_cp_group, packed_seq_params)
-        if self.config.linear_cp_comm_type == "all_gather":
-            cp_group_all_gather = cp_group
-            cp_group_a2a = None
-        elif self.config.linear_cp_comm_type == "a2a":
-            cp_group_all_gather = None
-            cp_group_a2a = cp_group
+        if self.config.linear_cp_mode == "chunkwise":
+            cp_group_chunkwise = cp_group
+            cp_group_headwise = None
+        elif self.config.linear_cp_mode == "headwise":
+            cp_group_chunkwise = None
+            cp_group_headwise = cp_group
         elif cp_group.size() == 1:
-            cp_group_all_gather = None
-            cp_group_a2a = None
+            cp_group_chunkwise = None
+            cp_group_headwise = None
         else:
             raise ValueError(
-                f"Unsupported linear_cp_comm_type {self.config.linear_cp_comm_type!r}; "
-                "expected 'a2a' or 'all_gather'."
+                f"Unsupported linear_cp_mode {self.config.linear_cp_mode!r}; "
+                "expected 'headwise' or 'chunkwise'."
             )
-        cp_size_all_gather = cp_group_all_gather.size() if cp_group_all_gather is not None else 1
-        cp_size_a2a = cp_group_a2a.size() if cp_group_a2a is not None else 1
+        cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
+        cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
 
         seq_len_local, batch, _ = hidden_states.shape
-        seq_len_post_a2a = seq_len_local * self.sp_size * cp_size_a2a
-        seq_len_global = seq_len_post_a2a * cp_size_all_gather
+        seq_len_post_headwise = seq_len_local * self.sp_size * cp_size_headwise
+        seq_len_global = seq_len_post_headwise * cp_size_chunkwise
 
         if inference_context is not None:
             assert (
@@ -400,15 +400,15 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
-        if cp_size_all_gather > 1:
+        if cp_size_chunkwise > 1:
             if cu_seqlens_q is None:
                 # Non-packed input: the only sources of cu_seqlens are the static
                 # global sequence length and batch size. Cache both the cu_seqlens
-                # tensor and the resulting all-gather CP context so we don't
+                # tensor and the resulting chunkwise CP context so we don't
                 # reallocate them on every forward — those reallocations break
                 # CUDA graph capture.
                 cache_key = (seq_len_global, batch)
-                cached = self._all_gather_cp_context_cache.get(cache_key)
+                cached = self._chunkwise_cp_context_cache.get(cache_key)
                 if cached is None:
                     cached_cu_seqlens = (
                         torch.arange(
@@ -418,83 +418,47 @@ class GatedDeltaNet(MegatronModule):
                     )
                     cached_ctx = build_cp_context(
                         cu_seqlens=cached_cu_seqlens,
-                        group=cp_group_all_gather,
+                        group=cp_group_chunkwise,
                         conv1d_kernel_size=self.conv_kernel_dim,
                     )
                     cached = (cached_cu_seqlens, cached_ctx)
-                    self._all_gather_cp_context_cache[cache_key] = cached
-                cu_seqlens_q, all_gather_cp_context = cached
+                    self._chunkwise_cp_context_cache[cache_key] = cached
+                cu_seqlens_q, chunkwise_cp_context = cached
             else:
-                all_gather_cp_context = build_cp_context(
+                chunkwise_cp_context = build_cp_context(
                     cu_seqlens=cu_seqlens_q,
-                    group=cp_group_all_gather,
+                    group=cp_group_chunkwise,
                     conv1d_kernel_size=self.conv_kernel_dim,
                 )
         else:
-            all_gather_cp_context = None
+            chunkwise_cp_context = None
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
-        # All-gather CP expects the contiguous-time chunk layout (rank r holds chunks
-        # [2r, 2r+1]) inside conv1d / chunk_gated_delta_rule, while Megatron
+        # Chunkwise CP expects the contiguous-time chunk layout (rank r holds chunks
+        # [2r, 2r+1]) inside conv1d / chunk_gated_delta_rule. Megatron attention CP
         # feeds us the zigzag attention-load-balanced layout (rank r holds
-        # [r, 2*cp-r-1]). Reshuffle chunks over the CP group with a single
+        # [r, 2*cp-r-1]), so reshuffle chunks over the CP group with a single
         # all-to-all — no full-sequence gather required.
-        if cp_size_all_gather > 1:
+        if cp_size_chunkwise > 1:
             nvtx_range_push(suffix="zigzag_to_contiguous")
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 qkvzba = zigzag_to_contiguous_chunks(
-                    qkvzba, cp_group_all_gather, seq_dim=0, cu_seqlens=cu_seqlens_q
+                    qkvzba, cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
                 )
             else:
                 qkvzba = zigzag_to_contiguous_chunks(
-                    qkvzba, cp_group_all_gather, seq_dim=0
+                    qkvzba, cp_group_chunkwise, seq_dim=0
                 )
             nvtx_range_pop(suffix="zigzag_to_contiguous")
 
-        # CP All to All: CP to HP
-        if (
-            packed_seq_params is not None
-            and packed_seq_params.qkv_format == 'thd'
-            and cp_size_a2a > 1
-        ):
-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // cp_size_a2a, dim=0)
-            outputs = []
-            for qkvzba_i in unpacked_qkvzba:
-                qkvzba_i = tensor_a2a_cp2hp(
-                    qkvzba_i,
-                    seq_dim=0,
-                    head_dim=-1,
-                    cp_group=cp_group_a2a,
-                    split_sections=[
-                        self.qk_dim_local_tp,
-                        self.qk_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.num_value_heads // self.tp_size,
-                        self.num_value_heads // self.tp_size,
-                    ],
-                )
-                outputs.append(qkvzba_i)
-            qkvzba = torch.cat(outputs, dim=0)
-        else:
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=cp_group_a2a,
-                split_sections=[
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
-                ],
-            )
+        # Headwise CP All to All: CP to HP.
+        qkvzba = self._headwise_cp2hp(
+            qkvzba, packed_seq_params, cu_seqlens_q, cp_size_headwise, cp_group_headwise
+        )
 
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
@@ -504,25 +468,25 @@ class GatedDeltaNet(MegatronModule):
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size_a2a,
-                self.v_dim_local_tp // cp_size_a2a,
-                self.num_value_heads // self.tp_size // cp_size_a2a,
-                self.num_value_heads // self.tp_size // cp_size_a2a,
+                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size_headwise,
+                self.v_dim_local_tp // cp_size_headwise,
+                self.num_value_heads // self.tp_size // cp_size_headwise,
+                self.num_value_heads // self.tp_size // cp_size_headwise,
             ],
             dim=-1,
         )
-        gate = gate.reshape(batch, seq_len_post_a2a, -1, self.value_head_dim)
-        beta = beta.reshape(batch, seq_len_post_a2a, -1)
-        alpha = alpha.reshape(batch, seq_len_post_a2a, -1)
+        gate = gate.reshape(batch, seq_len_post_headwise, -1, self.value_head_dim)
+        beta = beta.reshape(batch, seq_len_post_headwise, -1)
+        alpha = alpha.reshape(batch, seq_len_post_headwise, -1)
 
         kernel_batch = batch
-        kernel_seq_len = seq_len_post_a2a
-        if cp_size_all_gather > 1 and packed_seq_params is None and batch > 1:
+        kernel_seq_len = seq_len_post_headwise
+        if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
             # TODO: If additional gated delta rule backends are added, handle this
-            # SBHD + all-gather CP + batch>1 case per backend instead of
+            # SBHD + chunkwise CP + batch>1 case per backend instead of
             # unconditionally rejecting it.
             raise ValueError(
-                "GDN all-gather CP with SBHD inputs currently requires micro_batch_size == 1 "
+                "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
                 "because the FLA gated delta rule backend requires a single batch dimension "
                 "when cp_context is used. Use packed THD input or micro_batch_size=1."
             )
@@ -537,17 +501,17 @@ class GatedDeltaNet(MegatronModule):
             self.qk_dim_local_tp,
             self.v_dim_local_tp,
         ]
-        conv1d_weight = get_parameter_local_cp_a2a(
+        conv1d_weight = get_parameter_local_cp_headwise(
             self.conv1d.weight,
             dim=0,
-            cp_group=cp_group_a2a,
+            cp_group=cp_group_headwise,
             split_sections=qkv_channels_split_sections,
         )
         conv1d_bias = (
-            get_parameter_local_cp_a2a(
+            get_parameter_local_cp_headwise(
                 self.conv1d.bias,
                 dim=0,
-                cp_group=cp_group_a2a,
+                cp_group=cp_group_headwise,
                 split_sections=qkv_channels_split_sections,
             )
             if self.conv_bias
@@ -562,7 +526,7 @@ class GatedDeltaNet(MegatronModule):
                 stride=self.conv1d.stride,
                 padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // cp_size_a2a,
+                groups=self.conv_dim_local_tp // cp_size_headwise,
             )
             qkv = self.act_fn(conv_out[..., :kernel_seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
@@ -572,7 +536,7 @@ class GatedDeltaNet(MegatronModule):
             _pad_n = 0
             _conv_input = qkv.contiguous()
             _conv_cu_seqlens = cu_seqlens_q
-            _conv_cp_context = all_gather_cp_context
+            _conv_cp_context = chunkwise_cp_context
             if self.config.gdn_conv_pad_alignment is not None:
                 if packed_seq_params is None or cu_seqlens_q is None:
                     raise ValueError(
@@ -584,10 +548,10 @@ class GatedDeltaNet(MegatronModule):
                 _conv_input = torch.nn.functional.pad(_conv_input, (0, 0, 0, _pad_n))
                 _conv_cu_seqlens = cu_seqlens_q.clone()
                 _conv_cu_seqlens[-1] += _pad_n
-                if cp_size_all_gather > 1:
+                if cp_size_chunkwise > 1:
                     _conv_cp_context = build_cp_context(
                         cu_seqlens=_conv_cu_seqlens,
-                        group=cp_group_all_gather,
+                        group=cp_group_chunkwise,
                         conv1d_kernel_size=self.conv_kernel_dim,
                     )
             qkv, _ = causal_conv1d(
@@ -607,14 +571,18 @@ class GatedDeltaNet(MegatronModule):
         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
         query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-            qkv, gate, beta, alpha, kernel_batch, kernel_seq_len, cp_size_a2a=cp_size_a2a
+            qkv, gate, beta, alpha, kernel_batch, kernel_seq_len, cp_size_headwise=cp_size_headwise
         )
         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
-        A_log_local_cp = get_parameter_local_cp_a2a(self.A_log, dim=0, cp_group=cp_group_a2a)
-        dt_bias_local_cp = get_parameter_local_cp_a2a(self.dt_bias, dim=0, cp_group=cp_group_a2a)
+        A_log_local_cp = get_parameter_local_cp_headwise(
+            self.A_log, dim=0, cp_group=cp_group_headwise
+        )
+        dt_bias_local_cp = get_parameter_local_cp_headwise(
+            self.dt_bias, dim=0, cp_group=cp_group_headwise
+        )
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
@@ -629,7 +597,7 @@ class GatedDeltaNet(MegatronModule):
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
             cu_seqlens=cu_seqlens_q,
-            cp_context=all_gather_cp_context,
+            cp_context=chunkwise_cp_context,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
@@ -640,40 +608,28 @@ class GatedDeltaNet(MegatronModule):
 
         # Transpose: b s x --> s b x
         # From bshd back to sbhd format
-        norm_out = norm_out.reshape(batch, seq_len_post_a2a, -1)
+        norm_out = norm_out.reshape(batch, seq_len_post_headwise, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
 
         # Inverse of the zigzag -> contiguous reshuffle performed before conv1d.
         # Restores the Megatron attention-load-balanced layout that downstream
         # layers and loss computation expect.
-        if cp_size_all_gather > 1:
+        if cp_size_chunkwise > 1:
             nvtx_range_push(suffix="contiguous_to_zigzag")
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_all_gather, seq_dim=0, cu_seqlens=cu_seqlens_q
+                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
                 )
             else:
                 norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_all_gather, seq_dim=0
+                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0
                 )
             nvtx_range_pop(suffix="contiguous_to_zigzag")
 
-        # CP all to all: HP to CP
-        if (
-            packed_seq_params is not None
-            and packed_seq_params.qkv_format == 'thd'
-            and cp_size_a2a > 1
-        ):
-            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
-            outputs = []
-            for norm_out_i in unpacked_norm_out:
-                norm_out_i = tensor_a2a_hp2cp(
-                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=cp_group_a2a
-                )
-                outputs.append(norm_out_i)
-            norm_out = torch.cat(outputs, dim=0)
-        else:
-            norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group_a2a)
+        # Headwise CP All to All: HP to CP.
+        norm_out = self._headwise_hp2cp(
+            norm_out, packed_seq_params, cu_seqlens_q, cp_size_headwise, cp_group_headwise
+        )
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
@@ -694,9 +650,81 @@ class GatedDeltaNet(MegatronModule):
         y = y.to(x_dtype)
         return y
 
+    def _headwise_cp2hp(
+        self,
+        qkvzba: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams],
+        cu_seqlens_q: Optional[torch.Tensor],
+        cp_size_headwise: int,
+        cp_group_headwise: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """Apply the headwise CP all-to-all from context-parallel to head-parallel layout."""
+        split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+            self.v_dim_local_tp,
+            self.num_value_heads // self.tp_size,
+            self.num_value_heads // self.tp_size,
+        ]
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and cp_size_headwise > 1
+        ):
+            assert cu_seqlens_q is not None
+            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // cp_size_headwise, dim=0)
+            outputs = []
+            for qkvzba_i in unpacked_qkvzba:
+                qkvzba_i = tensor_a2a_cp2hp(
+                    qkvzba_i,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=cp_group_headwise,
+                    split_sections=split_sections,
+                )
+                outputs.append(qkvzba_i)
+            return torch.cat(outputs, dim=0)
+
+        return tensor_a2a_cp2hp(
+            qkvzba,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=cp_group_headwise,
+            split_sections=split_sections,
+        )
+
+    def _headwise_hp2cp(
+        self,
+        norm_out: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams],
+        cu_seqlens_q: Optional[torch.Tensor],
+        cp_size_headwise: int,
+        cp_group_headwise: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """Apply the headwise CP all-to-all from head-parallel back to context-parallel layout."""
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and cp_size_headwise > 1
+        ):
+            assert cu_seqlens_q is not None
+            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
+            outputs = []
+            for norm_out_i in unpacked_norm_out:
+                norm_out_i = tensor_a2a_hp2cp(
+                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=cp_group_headwise
+                )
+                outputs.append(norm_out_i)
+            return torch.cat(outputs, dim=0)
+
+        return tensor_a2a_hp2cp(
+            norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group_headwise
+        )
+
     @jit_fuser
     def _prepare_qkv_for_gated_delta_rule(
-        self, qkv, gate, beta, alpha, batch, seq_len, cp_size_a2a
+        self, qkv, gate, beta, alpha, batch, seq_len, cp_size_headwise
     ):
         """
         Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
@@ -705,7 +733,7 @@ class GatedDeltaNet(MegatronModule):
         # Split qkv into query_key and value
         query_key, value = torch.split(
             qkv,
-            [2 * self.qk_dim_local_tp // cp_size_a2a, self.v_dim_local_tp // cp_size_a2a],
+            [2 * self.qk_dim_local_tp // cp_size_headwise, self.v_dim_local_tp // cp_size_headwise],
             dim=-1,
         )
 
@@ -718,7 +746,7 @@ class GatedDeltaNet(MegatronModule):
             query_key = l2norm(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size_a2a
+        split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size_headwise
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
@@ -949,7 +977,7 @@ def _split_tensor_factory(
 ####################
 # Context parallel utilities
 ####################
-def get_parameter_local_cp_a2a(
+def get_parameter_local_cp_headwise(
     param: torch.Tensor,
     dim: int,
     cp_group: torch.distributed.ProcessGroup,
@@ -983,7 +1011,7 @@ def get_parameter_local_cp_a2a(
         inputs = torch.split(param, split_sections, dim=dim)
         outputs = []
         for p in inputs:
-            p = get_parameter_local_cp_a2a(p, dim, cp_group)
+            p = get_parameter_local_cp_headwise(p, dim, cp_group)
             outputs.append(p)
         return torch.cat(outputs, dim=dim)
 
@@ -1004,6 +1032,8 @@ def tensor_a2a_cp2hp(
     undo_attention_load_balancing: bool = True,
 ):
     """All-to-all context parallel to hidden parallel.
+
+    This communication primitive is used by GDN headwise CP mode.
 
     Args:
         tensor (torch.Tensor): The tensor to all-to-all.
@@ -1027,7 +1057,9 @@ def tensor_a2a_cp2hp(
         return tensor
 
     # Limitations of mamba_context_parallel._all_to_all_cp2hp.
-    assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
+    assert (
+        seq_dim == 0
+    ), f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
     assert (
         head_dim == -1 or head_dim == 2
     ), f"tensor_a2a_cp2hp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
@@ -1068,6 +1100,8 @@ def tensor_a2a_hp2cp(
 ):
     """All-to-all hidden parallel to context parallel.
 
+    This communication primitive is used by GDN headwise CP mode.
+
     Args:
         tensor (torch.Tensor): The tensor to all-to-all.
             Currently only support (seq_len, batch, head_dim) shaped tensor.
@@ -1090,13 +1124,15 @@ def tensor_a2a_hp2cp(
         return tensor
 
     # Limitations of mamba_context_parallel._all_to_all_hp2cp.
-    assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
+    assert (
+        seq_dim == 0
+    ), f"tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}"
     assert (
         head_dim == -1 or head_dim == 2
-    ), f"tensor_a2a_cp2hp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
+    ), f"tensor_a2a_hp2cp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
     assert (
         tensor.dim() == 3
-    ), f"tensor_a2a_cp2hp only supports 3-d input tensor for now, but got {tensor.dim()=}"
+    ), f"tensor_a2a_hp2cp only supports 3-d input tensor for now, but got {tensor.dim()=}"
 
     # Redo attention load balancing first if needed.
     if redo_attention_load_balancing:
