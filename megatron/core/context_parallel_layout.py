@@ -10,10 +10,7 @@ from megatron.core.tensor_parallel import all_to_all
 
 
 def get_thd_context_parallel_rank_indices(
-    cu_seqlens: torch.Tensor,
-    cp_size: int,
-    cp_rank: int,
-    layout: str,
+    cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, layout: str
 ) -> torch.Tensor:
     """Return global THD token indices owned by one CP rank in a layout.
 

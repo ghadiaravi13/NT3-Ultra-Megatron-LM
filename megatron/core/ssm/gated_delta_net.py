@@ -450,9 +450,7 @@ class GatedDeltaNet(MegatronModule):
                     qkvzba, cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
                 )
             else:
-                qkvzba = zigzag_to_contiguous_chunks(
-                    qkvzba, cp_group_chunkwise, seq_dim=0
-                )
+                qkvzba = zigzag_to_contiguous_chunks(qkvzba, cp_group_chunkwise, seq_dim=0)
             nvtx_range_pop(suffix="zigzag_to_contiguous")
 
         # Headwise CP All to All: CP to HP.
@@ -718,9 +716,7 @@ class GatedDeltaNet(MegatronModule):
                 outputs.append(norm_out_i)
             return torch.cat(outputs, dim=0)
 
-        return tensor_a2a_hp2cp(
-            norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group_headwise
-        )
+        return tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group_headwise)
 
     @jit_fuser
     def _prepare_qkv_for_gated_delta_rule(
@@ -1057,9 +1053,7 @@ def tensor_a2a_cp2hp(
         return tensor
 
     # Limitations of mamba_context_parallel._all_to_all_cp2hp.
-    assert (
-        seq_dim == 0
-    ), f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
+    assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
     assert (
         head_dim == -1 or head_dim == 2
     ), f"tensor_a2a_cp2hp only supports head_dim == -1 or 2 for now, but got {head_dim=}"
@@ -1124,9 +1118,7 @@ def tensor_a2a_hp2cp(
         return tensor
 
     # Limitations of mamba_context_parallel._all_to_all_hp2cp.
-    assert (
-        seq_dim == 0
-    ), f"tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}"
+    assert seq_dim == 0, f"tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}"
     assert (
         head_dim == -1 or head_dim == 2
     ), f"tensor_a2a_hp2cp only supports head_dim == -1 or 2 for now, but got {head_dim=}"

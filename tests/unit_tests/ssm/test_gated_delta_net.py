@@ -142,9 +142,7 @@ class TestGatedDeltaNet:
     def test_gpu_forward(self):
         gdn = self.gdn
 
-        micro_batch_size = (
-            1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
-        )
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -191,9 +189,7 @@ class TestGatedDeltaNet:
         gdn = self.gdn
         gdn.config.gdn_conv_pad_alignment = 4096
 
-        micro_batch_size = (
-            1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
-        )
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -434,6 +430,7 @@ class TestGDNCuSeqlensResolve:
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         with pytest.raises(ValueError, match="does not match"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
+
 
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
