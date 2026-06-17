@@ -44,8 +44,10 @@ def run_fused_qk_topk_with_loss(
     query_valid_rows: Optional[torch.Tensor] = None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
+    config: Optional[object] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Run fused TileLang indexer and sparse indexer loss."""
+    del config
     return tilelang_dsa.run_fused_qk_topk_with_loss(
         q=q,
         k=k,
