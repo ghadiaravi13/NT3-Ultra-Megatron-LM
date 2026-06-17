@@ -115,6 +115,7 @@ def run_fused_qk_topk_with_loss(
     if fn is None:
         return None
     return fn(
+        config=config,
         q=q,
         k=k,
         weights=weights,

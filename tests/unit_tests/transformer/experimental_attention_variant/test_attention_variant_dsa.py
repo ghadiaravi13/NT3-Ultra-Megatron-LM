@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -7,6 +8,7 @@ import torch
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    _validate_dsa_index_share_pipeline_split,
     get_dsa_module_spec_for_backend,
     get_experimental_attention_variant_module_spec,
 )
@@ -31,7 +33,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
     fused_qk_topk_naive,
+    is_dsa_skip_topk_layer,
     rotate_activation,
+    source_dsa_compute_layer,
     unfused_dsa_fn,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
@@ -63,6 +67,61 @@ def mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor
     This is a simple identity-like transformation that preserves shape and applies scaling.
     """
     return x * scale
+
+
+class TestDSAIndexShareHelpers:
+    """Test cross-layer top-k sharing helpers."""
+
+    def test_index_share_schedule_matches_compute_layers(self):
+        skip_topk_offset = 1
+        topk_freq = 4
+
+        assert not is_dsa_skip_topk_layer(1, skip_topk_offset, topk_freq)
+        assert is_dsa_skip_topk_layer(2, skip_topk_offset, topk_freq)
+        assert is_dsa_skip_topk_layer(4, skip_topk_offset, topk_freq)
+        assert not is_dsa_skip_topk_layer(5, skip_topk_offset, topk_freq)
+        assert source_dsa_compute_layer(4, skip_topk_offset, topk_freq) == 1
+        assert source_dsa_compute_layer(6, skip_topk_offset, topk_freq) == 5
+
+    def test_index_share_pipeline_split_rejects_cross_stage_source(self):
+        config = SimpleNamespace(
+            experimental_attention_variant="dsa",
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=1,
+        )
+
+        _validate_dsa_index_share_pipeline_split(config, [0, 1, 2, 3])
+        with pytest.raises(AssertionError, match="pipeline split is invalid"):
+            _validate_dsa_index_share_pipeline_split(config, [1, 2, 3, 4])
+
+    def test_skip_layer_does_not_build_indexer(self, monkeypatch):
+        def fail_build_module(*_args, **_kwargs):
+            raise AssertionError("skip layers must not build indexer modules")
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa.build_module",
+            fail_build_module,
+        )
+        config = SimpleNamespace(
+            dsa_indexer_topk=8,
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=1,
+            kv_channels=16,
+        )
+
+        attention = DSAttention(
+            config=config,
+            submodules=DSAttentionSubmodules(indexer=object()),
+            layer_number=2,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            softmax_scale=1.0,
+            pg_collection=SimpleNamespace(),
+        )
+
+        assert attention.skip_topk
+        assert attention.indexer is None
+        assert attention.source_layer == 1
 
 
 def _build_packed_causal_mask_for_test(
