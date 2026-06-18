@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
+
+if TYPE_CHECKING:
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 def run_fused_qk_topk(
@@ -21,11 +24,14 @@ def run_fused_qk_topk(
     ends: torch.Tensor,
     block_size: int,
     use_relu: bool = True,
-) -> Optional[torch.Tensor]:
+    use_local_indexer_varlen: bool = False,
+) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
     """Run fused TileLang indexer and return top-k indices."""
-    return tilelang_dsa.run_fused_qk_topk(
+    del use_local_indexer_varlen
+    topk_indices = tilelang_dsa.run_fused_qk_topk(
         q, k, weights, index_topk, starts, ends, block_size, use_relu
     )
+    return topk_indices, None
 
 
 def run_fused_qk_topk_with_loss(
@@ -44,11 +50,12 @@ def run_fused_qk_topk_with_loss(
     query_valid_rows: Optional[torch.Tensor] = None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
-    config: Optional[object] = None,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    config: Optional["TransformerConfig"] = None,
+    use_local_indexer_varlen: bool = False,
+) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
     """Run fused TileLang indexer and sparse indexer loss."""
-    del config
-    return tilelang_dsa.run_fused_qk_topk_with_loss(
+    del config, use_local_indexer_varlen
+    result = tilelang_dsa.run_fused_qk_topk_with_loss(
         q=q,
         k=k,
         weights=weights,
@@ -65,6 +72,10 @@ def run_fused_qk_topk_with_loss(
         calculate_per_token_loss=calculate_per_token_loss,
         use_relu=use_relu,
     )
+    if result is None:
+        return None
+    topk_indices, indexer_loss = result
+    return topk_indices, None, indexer_loss
 
 
 def run_fused_absorbed_sparse_attention(
@@ -73,8 +84,10 @@ def run_fused_absorbed_sparse_attention(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     v_channels: int,
+    topk_length: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Run fused TileLang SparseMLA for absorbed DSA sparse attention."""
+    del topk_length
     return tilelang_dsa.run_fused_absorbed_sparse_attention(
         query, key, topk_indices, softmax_scale, v_channels
     )
