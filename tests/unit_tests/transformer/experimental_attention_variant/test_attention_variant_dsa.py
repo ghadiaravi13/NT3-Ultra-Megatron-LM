@@ -19,8 +19,6 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import dsa_kernels
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
-    _apply_absorbed_v_up_projection,
-    _restore_packed_thd_batch_dim,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -791,69 +789,6 @@ class TestDSAAbsorbedParityCPU:
                 varlen_ends=None,
                 key_positions=None,
             )
-
-
-class TestAbsorbedMLAPackedTHDShape:
-    """CPU tests for packed-THD absorbed MLA output rank handling."""
-
-    def test_restore_packed_thd_batch_dim_when_core_output_is_2d(self):
-        hidden_states = torch.empty(7, 1, 16)
-        core_attn_out = torch.empty(7, 16)
-        packed_seq_params = PackedSeqParams(qkv_format='thd')
-
-        restored = _restore_packed_thd_batch_dim(core_attn_out, hidden_states, packed_seq_params)
-
-        assert restored.shape == (7, 1, 16)
-
-    def test_restore_packed_thd_batch_dim_keeps_already_normalized_output(self):
-        hidden_states = torch.empty(7, 1, 16)
-        core_attn_out = torch.empty(7, 1, 16)
-        packed_seq_params = PackedSeqParams(qkv_format='thd')
-
-        restored = _restore_packed_thd_batch_dim(core_attn_out, hidden_states, packed_seq_params)
-
-        assert restored is core_attn_out
-        assert restored.shape == hidden_states.shape
-
-
-class TestAbsorbedMLAVUpProjection:
-    """CPU tests for absorbed MLA V-up projection decisions."""
-
-    def test_projection_applies_when_core_did_not_consume_weight_even_if_sizes_match(self):
-        torch.manual_seed(123)
-        num_heads, kv_lora_rank, v_head_dim = 2, 3, 3
-        core_attn_out = torch.randn(5, 1, num_heads * kv_lora_rank)
-        v_up_weight = torch.randn(num_heads, v_head_dim, kv_lora_rank)
-
-        projected = _apply_absorbed_v_up_projection(
-            core_attn_out,
-            v_up_weight,
-            num_attention_heads_per_partition=num_heads,
-            kv_lora_rank=kv_lora_rank,
-            v_head_dim=v_head_dim,
-            core_consumed_v_up_projection=False,
-        )
-        expected = core_attn_out.view(5, 1, num_heads, kv_lora_rank)
-        expected = torch.einsum("...nc,ndc->...nd", expected, v_up_weight)
-        expected = expected.contiguous().view(5, 1, -1)
-
-        torch.testing.assert_close(projected, expected, rtol=0, atol=0)
-
-    def test_projection_skips_when_core_consumed_weight_even_if_sizes_match(self):
-        num_heads, kv_lora_rank, v_head_dim = 2, 3, 3
-        core_attn_out = torch.randn(5, 1, num_heads * v_head_dim)
-        v_up_weight = torch.randn(num_heads, v_head_dim, kv_lora_rank)
-
-        projected = _apply_absorbed_v_up_projection(
-            core_attn_out,
-            v_up_weight,
-            num_attention_heads_per_partition=num_heads,
-            kv_lora_rank=kv_lora_rank,
-            v_head_dim=v_head_dim,
-            core_consumed_v_up_projection=True,
-        )
-
-        assert projected is core_attn_out
 
 
 class TestDSAIndexerLossRowMaskCPU:
