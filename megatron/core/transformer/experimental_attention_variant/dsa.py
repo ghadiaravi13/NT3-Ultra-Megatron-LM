@@ -147,6 +147,8 @@ def _run_sparse_attention(
                 latent_v_channels,
                 topk_length=topk_length,
             )
+        # Fused backends may decline unsupported shapes or layouts by returning
+        # None, so keep the absorbed PyTorch path as the authoritative fallback.
         if output is None:
             output = _unfused_absorbed_dsa_fn(
                 query,
@@ -159,6 +161,7 @@ def _run_sparse_attention(
                 varlen_ends=varlen_ends,
                 key_positions=key_positions,
             )
+        assert output is not None
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
         output = output.view(output.size(0), output.size(1), -1)
         return output
@@ -782,7 +785,9 @@ def bwd_fused_indexer_loss_naive(
         # attention scores are scattered to TP ranks in head dimension.
         torch.distributed.all_reduce(attention_scores_sum.contiguous(), group=pg_collection.tp)
 
-    # L1 normalize
+    # L1 normalize. Fully masked packed/varlen rows can have zero summed
+    # attention mass; clamp the denominator so those rows stay finite and are
+    # later zeroed by the row-valid loss mask.
     attention_scores_normalized = attention_scores_sum / attention_scores_sum.sum(
         dim=-1, keepdim=True
     ).clamp_min(1e-10)

@@ -31,6 +31,7 @@ from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
+    _validate_dsa_kernel_backend_dependencies,
     get_te_version,
     init_method_normal,
     is_te_min_version,
@@ -41,72 +42,12 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
-_VALID_DSA_KERNEL_BACKENDS = ("none", "tilelang", "cudnn")
-
 try:
     from packaging.version import Version as PkgVersion
 
     HAVE_PACKAGING = True
 except ImportError:
     HAVE_PACKAGING = False
-
-
-def _missing_tilelang_dsa_kernel_dependencies() -> List[str]:
-    """Return missing TileLang DSA kernel dependencies."""
-    try:
-        from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
-    except (ImportError, OSError):
-        return ["TileLang DSA kernels"]
-
-    missing = []
-    if tilelang_dsa.lighting_indexer is None:
-        missing.append("TileLang DSA indexer")
-    if tilelang_dsa.SparseMLA is None:
-        missing.append("TileLang SparseMLA")
-    return missing
-
-
-def _missing_cudnn_dsa_kernel_dependencies() -> List[str]:
-    """Return missing cuDNN DSA kernel dependencies."""
-    missing = []
-    try:
-        from flash_mla import flash_mla_sparse_fwd  # noqa: F401
-    except ImportError:
-        missing.append("flash_mla")
-
-    try:
-        from cudnn import DSA  # noqa: F401
-    except ImportError:
-        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
-    return missing
-
-
-def _validate_dsa_kernel_backend_dependencies(dsa_kernel_backend: str) -> None:
-    """Validate optional fused DSA kernel backend dependencies."""
-    if dsa_kernel_backend not in _VALID_DSA_KERNEL_BACKENDS:
-        raise ValueError(
-            "dsa_kernel_backend must be one of: " f"{', '.join(_VALID_DSA_KERNEL_BACKENDS)}."
-        )
-    if dsa_kernel_backend == "none":
-        return
-    if not torch.cuda.is_available():
-        raise ValueError(
-            f"dsa_kernel_backend={dsa_kernel_backend} requires a CUDA device, "
-            "but none is available."
-        )
-
-    missing = []
-    if dsa_kernel_backend == "tilelang":
-        missing = _missing_tilelang_dsa_kernel_dependencies()
-    elif dsa_kernel_backend == "cudnn":
-        missing = _missing_cudnn_dsa_kernel_dependencies()
-
-    if missing:
-        raise ValueError(
-            f"dsa_kernel_backend={dsa_kernel_backend} requires fused DSA kernels, "
-            f"but the following packages are not available: {', '.join(missing)}. "
-            "Install them or set dsa_kernel_backend=none to use the PyTorch fallback."
-        )
 
 
 @dataclass
