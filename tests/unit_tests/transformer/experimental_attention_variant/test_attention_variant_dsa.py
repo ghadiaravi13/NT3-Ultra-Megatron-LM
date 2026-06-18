@@ -2793,6 +2793,7 @@ class TestDSAModuleSpecDispatch:
         Utils.destroy_model_parallel()
 
     def _make_dsa_config(self, **kwargs):
+        kwargs.setdefault("add_bias_linear", False)
         return MLATransformerConfig(
             num_layers=2,
             hidden_size=256,
@@ -2820,6 +2821,11 @@ class TestDSAModuleSpecDispatch:
         spec = get_experimental_attention_variant_module_spec(config)
         assert spec.module == AbsorbedMLASelfAttention
         assert spec.submodules.core_attention.module == DSAttention
+
+    def test_dsa_rejects_bias_linear(self):
+        """DSA config validation rejects bias because absorbed MLA does not support it."""
+        with pytest.raises(ValueError, match="requires add_bias_linear=False"):
+            self._make_dsa_config(experimental_attention_variant="dsa", add_bias_linear=True)
 
     def test_dsa_cp_requires_allgather_cp_comm_type(self):
         """DSA context parallelism should fail early for unsupported CP communication."""
