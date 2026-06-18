@@ -790,6 +790,47 @@ class TestDSAAbsorbedParityCPU:
                 key_positions=None,
             )
 
+    def test_absorbed_path_all_invalid_topk_rows_return_zero(self):
+        """Absorbed fallback should zero rows with no valid sparse entries."""
+        torch.manual_seed(123)
+        sq, bsz, nheads = 4, 1, 2
+        kv_lora_rank, qk_pos_dim, vdim = 4, 2, 3
+        config = type(
+            "Config", (), {"kv_lora_rank": kv_lora_rank, "attention_backend": "unfused"}
+        )()
+
+        query = torch.randn(
+            sq, bsz, nheads, kv_lora_rank + qk_pos_dim, dtype=torch.float32, requires_grad=True
+        )
+        key = torch.randn(
+            sq, bsz, 1, kv_lora_rank + qk_pos_dim, dtype=torch.float32, requires_grad=True
+        )
+        up_v_weight = torch.randn(nheads, vdim, kv_lora_rank, dtype=torch.float32)
+        up_v_weight.requires_grad_()
+        topk_indices = torch.full((bsz, sq, 3), -1, dtype=torch.int64)
+
+        out = _run_sparse_attention(
+            absorbed_mla=True,
+            query=query,
+            key=key,
+            value=None,
+            up_v_weight=up_v_weight,
+            topk_indices=topk_indices,
+            softmax_scale=1.0,
+            config=config,
+            mask=None,
+            varlen_starts=None,
+            varlen_ends=None,
+            key_positions=None,
+        )
+        out.square().sum().backward()
+
+        assert torch.isfinite(out).all()
+        assert torch.count_nonzero(out).item() == 0
+        assert query.grad is not None and torch.isfinite(query.grad).all()
+        assert key.grad is not None and torch.isfinite(key.grad).all()
+        assert up_v_weight.grad is not None and torch.isfinite(up_v_weight.grad).all()
+
 
 class TestDSAIndexerLossRowMaskCPU:
     """CPU tests for packed-row masking in DSA indexer loss."""

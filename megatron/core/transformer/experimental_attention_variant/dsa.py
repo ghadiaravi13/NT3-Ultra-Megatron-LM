@@ -98,8 +98,11 @@ def _unfused_absorbed_dsa_fn(
         key_positions=key_positions,
     )
 
-    attention_scores += index_mask.unsqueeze(1)
-    attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+    attention_scores = attention_scores + index_mask.unsqueeze(1)
+    valid_index_mask = torch.isfinite(index_mask)
+    attention_scores = dsa_masking.masked_softmax(
+        attention_scores.float(), valid_index_mask.unsqueeze(1).expand(b, np, sq, skv), dim=-1
+    )
 
     # Latent value is the first v_channels slice of absorbed key cache.
     value = key[..., :v_channels].permute(1, 2, 0, 3)  # [b,1,skv,v]
