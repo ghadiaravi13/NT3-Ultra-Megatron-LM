@@ -36,6 +36,8 @@ def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: 
     """Return whether a 1-indexed layer reuses a previous DSA top-k result."""
     if layer_number < 1:
         raise ValueError(f"layer_number must be 1-indexed and positive, got {layer_number}.")
+    if skip_topk_offset < 0:
+        raise ValueError(f"skip_topk_offset must be non-negative, got {skip_topk_offset}.")
     if topk_freq < 1:
         raise ValueError(f"topk_freq must be positive, got {topk_freq}.")
     return (max(layer_number - skip_topk_offset, 0) % topk_freq) != 0
@@ -116,6 +118,7 @@ def _run_sparse_attention(
     varlen_starts: Optional[torch.Tensor],
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
+    topk_length: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
     if absorbed_mla:
@@ -136,7 +139,13 @@ def _run_sparse_attention(
         output = None
         if dsa_kernels.use_fused_dsa_kernels(config):
             output = dsa_kernels.run_fused_absorbed_sparse_attention(
-                config, query, key, topk_indices, softmax_scale, latent_v_channels
+                config,
+                query,
+                key,
+                topk_indices,
+                softmax_scale,
+                latent_v_channels,
+                topk_length=topk_length,
             )
         if output is None:
             output = _unfused_absorbed_dsa_fn(
@@ -1133,7 +1142,7 @@ class DSAIndexer(MegatronModule):
         self.softmax_scale: float = self.index_head_dim**-0.5
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         self.pg_collection = pg_collection
 
         # Initialize Position Embedding.
@@ -1540,6 +1549,7 @@ class DSAttention(MegatronModule):
 
     consumes_absorbed_v_up_projection = True
     _HOLDER_ATTR = "_dsa_index_share_topk_holder"
+    _LENGTH_HOLDER_ATTR = "_dsa_index_share_topk_length_holder"
 
     def __init__(
         self,
@@ -1574,7 +1584,7 @@ class DSAttention(MegatronModule):
         )
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         self.pg_collection = pg_collection
 
         self.indexer = None
@@ -1595,7 +1605,7 @@ class DSAttention(MegatronModule):
     ) -> dict[int, torch.Tensor]:
         """Return the per-microbatch top-k holder for DSA index sharing."""
         if packed_seq_params is None:
-            raise AssertionError(
+            raise RuntimeError(
                 "DSA index-share requires packed_seq_params to carry the per-microbatch "
                 "top-k holder. Disable dsa_indexer_topk_freq sharing or run with packed "
                 "sequence parameters."
@@ -1604,6 +1614,16 @@ class DSAttention(MegatronModule):
         if holder is None:
             holder = {}
             setattr(packed_seq_params, self._HOLDER_ATTR, holder)
+        return holder
+
+    def _get_index_share_topk_length_holder(
+        self, packed_seq_params: PackedSeqParams
+    ) -> dict[int, torch.Tensor]:
+        """Return the optional per-microbatch top-k length holder."""
+        holder = getattr(packed_seq_params, self._LENGTH_HOLDER_ATTR, None)
+        if holder is None:
+            holder = {}
+            setattr(packed_seq_params, self._LENGTH_HOLDER_ATTR, holder)
         return holder
 
     def forward(
@@ -1786,13 +1806,19 @@ class DSAttention(MegatronModule):
         topk_holder = (
             self._get_index_share_topk_holder(packed_seq_params) if self.index_share else None
         )
+        topk_length_holder = (
+            self._get_index_share_topk_length_holder(packed_seq_params)
+            if self.index_share
+            else None
+        )
         topk_indices = None
+        topk_length = None
         q = k = weights = None
 
         if self.skip_topk:
             assert topk_holder is not None
             if self.source_layer not in topk_holder:
-                raise AssertionError(
+                raise RuntimeError(
                     "DSA index-share skip layer "
                     f"(layer_number={self.layer_number}) needs top-k indices from source "
                     f"computing layer {self.source_layer}, but that layer did not run before it "
@@ -1803,6 +1829,8 @@ class DSAttention(MegatronModule):
                     f"Holder has layers {sorted(topk_holder)}."
                 )
             topk_indices = topk_holder[self.source_layer]
+            if topk_length_holder is not None:
+                topk_length = topk_length_holder.get(self.source_layer)
         else:
             assert self.indexer is not None
             q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
@@ -1923,9 +1951,10 @@ class DSAttention(MegatronModule):
                     query_valid_rows=query_valid_rows,
                     calculate_per_token_loss=self.config.calculate_per_token_loss,
                     use_relu=self.config.dsa_indexer_scoring_relu,
+                    use_local_indexer_varlen=use_local_indexer_varlen,
                 )
                 if fused_topk_with_loss is not None:
-                    topk_indices, indexer_loss = fused_topk_with_loss
+                    topk_indices, topk_length, indexer_loss = fused_topk_with_loss
 
             if topk_indices is None or indexer_loss is None:
                 topk_indices, indexer_loss = compute_indexer_loss_with_reference_path()
@@ -1947,7 +1976,7 @@ class DSAttention(MegatronModule):
             if fused_bounds is not None:
                 starts_i32, ends_i32 = fused_bounds
                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
-                topk_indices = dsa_kernels.run_fused_qk_topk(
+                fused_topk = dsa_kernels.run_fused_qk_topk(
                     self.config,
                     q,
                     k,
@@ -1957,7 +1986,10 @@ class DSAttention(MegatronModule):
                     ends_i32,
                     block_size=max(1, block_size),
                     use_relu=self.config.dsa_indexer_scoring_relu,
+                    use_local_indexer_varlen=use_local_indexer_varlen,
                 )
+                if fused_topk is not None:
+                    topk_indices, topk_length = fused_topk
 
             if topk_indices is None:
                 _, topk_indices = fused_qk_topk_naive(
@@ -1975,6 +2007,8 @@ class DSAttention(MegatronModule):
         if self.index_share and computes_topk:
             assert topk_holder is not None and topk_indices is not None
             topk_holder[self.layer_number] = topk_indices
+            if topk_length_holder is not None and topk_length is not None:
+                topk_length_holder[self.layer_number] = topk_length
 
         # ===================================
         # Run sparse attention kernel
@@ -1986,6 +2020,7 @@ class DSAttention(MegatronModule):
             value=value,
             up_v_weight=up_v_weight,
             topk_indices=topk_indices,
+            topk_length=topk_length,
             softmax_scale=self.softmax_scale,
             config=self.config,
             mask=float_mask,

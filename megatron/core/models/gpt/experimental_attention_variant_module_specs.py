@@ -363,7 +363,7 @@ def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_la
             source_layer_id not in local_layer_positions
             or local_layer_positions[source_layer_id] > position
         ):
-            raise AssertionError(
+            raise RuntimeError(
                 "DSA index-share pipeline split is invalid: local layer "
                 f"{layer_number} reuses top-k indices from computing layer "
                 f"{source_layer_number}, but that source layer is not earlier in this "

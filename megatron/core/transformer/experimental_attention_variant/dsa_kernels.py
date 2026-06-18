@@ -78,7 +78,8 @@ def run_fused_qk_topk(
     ends: Tensor,
     block_size: int,
     use_relu: bool = True,
-) -> Optional[Tensor]:
+    use_local_indexer_varlen: bool = False,
+) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
     """Optional fused indexer hook for backend-specific implementations."""
     backend = _load_backend(config)
     if backend is None:
@@ -86,7 +87,9 @@ def run_fused_qk_topk(
     fn = getattr(backend, "run_fused_qk_topk", None)
     if fn is None:
         return None
-    return fn(q, k, weights, index_topk, starts, ends, block_size, use_relu)
+    return fn(
+        q, k, weights, index_topk, starts, ends, block_size, use_relu, use_local_indexer_varlen
+    )
 
 
 def run_fused_qk_topk_with_loss(
@@ -106,7 +109,8 @@ def run_fused_qk_topk_with_loss(
     query_valid_rows: Optional[Tensor] = None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
-) -> Optional[Tuple[Tensor, Tensor]]:
+    use_local_indexer_varlen: bool = False,
+) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
     """Optional fused indexer+loss hook for backend-specific implementations."""
     backend = _load_backend(config)
     if backend is None:
@@ -131,6 +135,7 @@ def run_fused_qk_topk_with_loss(
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
         use_relu=use_relu,
+        use_local_indexer_varlen=use_local_indexer_varlen,
     )
 
 
@@ -141,6 +146,7 @@ def run_fused_absorbed_sparse_attention(
     topk_indices: Tensor,
     softmax_scale: float,
     v_channels: int,
+    topk_length: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     """Optional fused sparse-attention hook for backend-specific implementations."""
     backend = _load_backend(config)
@@ -149,7 +155,7 @@ def run_fused_absorbed_sparse_attention(
     fn = getattr(backend, "run_fused_absorbed_sparse_attention", None)
     if fn is None:
         return None
-    return fn(query, key, topk_indices, softmax_scale, v_channels)
+    return fn(query, key, topk_indices, softmax_scale, v_channels, topk_length)
 
 
 def run_fused_dsa_attention(

@@ -91,7 +91,7 @@ class TestDSAIndexShareHelpers:
         )
 
         _validate_dsa_index_share_pipeline_split(config, [0, 1, 2, 3])
-        with pytest.raises(AssertionError, match="pipeline split is invalid"):
+        with pytest.raises(RuntimeError, match="pipeline split is invalid"):
             _validate_dsa_index_share_pipeline_split(config, [1, 2, 3, 4])
 
     def test_skip_layer_does_not_build_indexer(self, monkeypatch):
