@@ -370,6 +370,10 @@ class MultiLatentAttention(Attention):
 
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
+        core_attention_extra_kwargs = {}
+        if getattr(self.core_attention, "requires_dsa_inputs", False):
+            core_attention_extra_kwargs = {"x": hidden_states, "qr": q_compressed}
+
         # ==================================
         # core attention computation
         # ==================================
@@ -377,7 +381,12 @@ class MultiLatentAttention(Attention):
         needs_output_trim = False
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, packed_seq_params=packed_seq_params
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
@@ -391,6 +400,7 @@ class MultiLatentAttention(Attention):
                         attention_mask,
                         packed_seq_params=packed_seq_params,
                         attn_mask_type=attn_mask_type,
+                        **core_attention_extra_kwargs,
                     )
             elif self.cache_mla_latents:
                 value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
@@ -1329,17 +1339,6 @@ class FusedMLASelfAttention(MLASelfAttention):
         )
         return q_compressed, kv_combined
 
-    def backward_dw(self) -> NoReturn:
-        """Execute weight gradient computation."""
-        self.linear_kv_up_proj.backward_dw()
-        self.linear_qkv_down_proj.backward_dw()
-        self.linear_q_up_proj.backward_dw()
-        self._backward_output_proj()
-
-    def set_for_recompute_input_layernorm(self):
-        """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
-        set_save_original_input(self.linear_qkv_down_proj)
-
     def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
         """Return a sharded state dict compatible with pre-fusion checkpoints."""
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
@@ -1376,11 +1375,8 @@ class FusedMLASelfAttention(MLASelfAttention):
                 sharded_state_dict[q_extra_key] = fused_obj
                 sharded_state_dict[kv_extra_key] = fused_obj
 
-        # Keep fused layernorm params so TransformerLayer's key map can load old
-        # input_layernorm checkpoints into the fused TE down-proj module.
         for key in list(sharded_state_dict.keys()):
-            suffix = key[len(fused_prefix) :] if key.startswith(fused_prefix) else ""
-            if key.startswith(fused_prefix) and not suffix.startswith("layer_norm_"):
+            if key.startswith(fused_prefix):
                 del sharded_state_dict[key]
 
         fused_weight = self.linear_qkv_down_proj.weight
@@ -1424,12 +1420,8 @@ class FusedMLASelfAttention(MLASelfAttention):
 
         return sharded_state_dict
 
-    def _synthetic_state_dict_key_suffixes(self):
-        """Return source checkpoint keys used to locate this module in a state dict."""
-        return ("linear_q_down_proj.weight",)
-
-    def _synthesize_fused_qkv_down_weight(self, state_dict, prefix):
-        """Materialize fused qkv-down weight from old separate q/kv checkpoint keys."""
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Load state dict with automatic unfused->fused conversion."""
         q_key = f"{prefix}linear_q_down_proj.weight"
         kv_key = f"{prefix}linear_kv_down_proj.weight"
         fused_key = f"{prefix}linear_qkv_down_proj.weight"
@@ -1445,9 +1437,5 @@ class FusedMLASelfAttention(MLASelfAttention):
             del state_dict[kv_key]
             state_dict.pop(f"{prefix}linear_q_down_proj.bias", None)
             state_dict.pop(f"{prefix}linear_kv_down_proj.bias", None)
-
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        """Load state dict with automatic unfused->fused conversion."""
-        self._synthesize_fused_qkv_down_weight(state_dict, prefix)
 
         return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
