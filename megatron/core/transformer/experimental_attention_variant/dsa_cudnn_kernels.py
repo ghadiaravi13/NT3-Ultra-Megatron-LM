@@ -417,6 +417,33 @@ def _compact_valid_topk_indices(topk_indices: Tensor) -> Tuple[Tensor, Tensor]:
     return compacted.contiguous(), topk_length.contiguous()
 
 
+def _compact_valid_topk_indices_and_scores(
+    topk_indices: Tensor, topk_scores: Tensor
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Move valid top-K entries and their aligned score payload to the left."""
+    if topk_indices.shape != topk_scores.shape:
+        raise RuntimeError(
+            "top-k indices and score payload must have the same shape, "
+            f"got {topk_indices.shape} and {topk_scores.shape}."
+        )
+    valid = (topk_indices >= 0) & torch.isfinite(topk_scores)
+    topk_length = valid.sum(dim=-1).int()
+    positions = torch.arange(topk_indices.size(-1), device=topk_indices.device).view(
+        *((1,) * (topk_indices.ndim - 1)), -1
+    )
+    sentinel = torch.full_like(positions, topk_indices.size(-1)).expand_as(topk_indices)
+    order_key = torch.where(valid, positions.expand_as(topk_indices), sentinel)
+    order = order_key.argsort(dim=-1)
+    compacted_indices = torch.gather(topk_indices, dim=-1, index=order)
+    compacted_scores = torch.gather(topk_scores, dim=-1, index=order)
+    compacted_valid = torch.gather(valid, dim=-1, index=order)
+    compacted_indices = compacted_indices.masked_fill(~compacted_valid, -1)
+    compacted_scores = compacted_scores.masked_fill(
+        ~compacted_valid, torch.finfo(torch.float32).min
+    )
+    return compacted_indices.contiguous(), topk_length.contiguous(), compacted_scores.contiguous()
+
+
 def _sort_valid_topk_indices_by_index(topk_indices: Tensor, topk_length: Tensor, sk: int) -> Tensor:
     """Canonicalize consumed top-K indices while keeping ignored suffix slots invalid."""
     positions = torch.arange(topk_indices.size(-1), device=topk_indices.device).view(
@@ -634,11 +661,9 @@ def _indexer_topk_bshd(
             topk_scores = torch.cat([topk_scores, score_pad], dim=-1)
 
     if return_topk_scores:
-        if starts is not None:
-            topk_length = (ends - starts).view(1, sq).expand(b, sq)
-            topk_length = topk_length.clamp(min=0, max=topk_k).to(torch.int32).contiguous()
-        else:
-            topk_length = _valid_topk_length(topk_indices)
+        topk_indices, topk_length, topk_scores = _compact_valid_topk_indices_and_scores(
+            topk_indices, topk_scores
+        )
         return topk_indices.int().contiguous(), topk_length, topk_scores
 
     if return_scores:
@@ -836,23 +861,27 @@ def _compute_attn_target(
     k_attn_bsd: Tensor,
     lse: Tensor,
     topk_indices: Tensor,
+    topk_length: Optional[Tensor],
     softmax_scale: float,
     qhead_per_kv_head: int,
 ) -> Tensor:
     """Compute sparse indexer-loss target with cuDNN Frontend DSA.
 
-    ``topk_indices`` carries invalid suffix entries as ``-1``.
+    ``topk_indices`` carries invalid suffix entries as ``-1`` and
+    ``topk_length`` marks the consumed compact prefix for each row.
     """
     _ensure_dsa_namespace()
     q_attn_bshd, lse, qhead_per_kv_head = _pad_attn_target_heads(q_attn_bshd, lse)
+    kwargs = {"qhead_per_kv_head": qhead_per_kv_head, "topk_indices_global": False}
+    if topk_length is not None:
+        kwargs["topk_length"] = topk_length.to(dtype=torch.int32, device=topk_indices.device)
     result = _DSA.sparse_attn_score_recompute_wrapper(
         q_attn_bshd,
         k_attn_bsd,
         lse.contiguous(),
         topk_indices.contiguous(),
         softmax_scale,
-        qhead_per_kv_head=qhead_per_kv_head,
-        topk_indices_global=False,
+        **kwargs,
     )
     return result["target"].contiguous()
 
@@ -969,6 +998,7 @@ def _compute_sparse_indexer_loss_and_grads(
     k_idx_bsd: Tensor,
     w_bsh: Tensor,
     topk_indices_cmp: Tensor,
+    topk_length_cmp: Tensor,
     indexer_score_payload: Tensor,
     query: Tensor,
     kv_full: Tensor,
@@ -995,7 +1025,10 @@ def _compute_sparse_indexer_loss_and_grads(
         q_idx_bshd, w_bsh
     )
 
-    valid_positions = topk_indices_cmp >= 0
+    positions = torch.arange(topk_indices_cmp.size(-1), device=topk_indices_cmp.device).view(
+        *((1,) * (topk_indices_cmp.ndim - 1)), -1
+    )
+    valid_positions = (positions < topk_length_cmp.unsqueeze(-1)) & (topk_indices_cmp >= 0)
     if query_valid_rows is not None:
         valid_positions = valid_positions & query_valid_rows.unsqueeze(-1)
     predict = dsa_masking.masked_softmax(indexer_score_payload, valid_positions, dim=-1)
@@ -1005,6 +1038,7 @@ def _compute_sparse_indexer_loss_and_grads(
         k_attn_compressed_bsd,
         lse_bsqh,
         topk_indices_cmp,
+        topk_length_cmp,
         softmax_scale,
         qhead_per_kv_head=num_heads,
     )
@@ -1290,6 +1324,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                     k_idx_bsd=k_idx_bsd,
                     w_bsh=w_bsh,
                     topk_indices_cmp=topk_indices_cmp,
+                    topk_length_cmp=topk_length_cmp,
                     indexer_score_payload=indexer_score_payload,
                     query=query,
                     kv_full=kv_full,
@@ -1475,7 +1510,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         )
 
         q_idx_bshd, k_idx_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q_indexer, k_indexer, weights)
-        topk_indices_cmp, _topk_length_cmp, indexer_score_payload = _indexer_topk_bshd(
+        topk_indices_cmp, topk_length_cmp, indexer_score_payload = _indexer_topk_bshd(
             q_idx_bshd,
             k_idx_bsd,
             w_bsh,
@@ -1506,6 +1541,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             k_idx_bsd=k_idx_bsd,
             w_bsh=w_bsh,
             topk_indices_cmp=topk_indices_cmp,
+            topk_length_cmp=topk_length_cmp,
             indexer_score_payload=indexer_score_payload,
             query=query,
             kv_full=kv_full,
