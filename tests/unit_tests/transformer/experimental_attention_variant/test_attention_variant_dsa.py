@@ -81,6 +81,19 @@ class TestDSAIndexShareHelpers:
         assert source_dsa_compute_layer(4, skip_topk_offset, topk_freq) == 1
         assert source_dsa_compute_layer(6, skip_topk_offset, topk_freq) == 5
 
+    def test_index_share_helpers_validate_inputs(self):
+        with pytest.raises(ValueError, match="layer_number"):
+            is_dsa_skip_topk_layer(0, 0, 1)
+        with pytest.raises(ValueError, match="skip_topk_offset"):
+            is_dsa_skip_topk_layer(1, -1, 1)
+        with pytest.raises(ValueError, match="topk_freq"):
+            is_dsa_skip_topk_layer(1, 0, 0)
+
+        assert not is_dsa_skip_topk_layer(1, 0, 4)
+        assert is_dsa_skip_topk_layer(2, 0, 4)
+        assert source_dsa_compute_layer(1, 0, 4) == 1
+        assert source_dsa_compute_layer(4, 0, 4) == 1
+
     def test_index_share_pipeline_split_rejects_cross_stage_source(self):
         config = SimpleNamespace(
             experimental_attention_variant="dsa",
@@ -287,6 +300,239 @@ def test_dsa_kernel_backend_selects_optional_kernel_module():
     config.dsa_kernel_backend = "invalid"
     with pytest.raises(ValueError, match="dsa_kernel_backend"):
         dsa_kernels._get_backend_module_name(config)
+
+
+def test_dsa_kernel_backend_loader_cache_and_import_errors(monkeypatch):
+    class Config:
+        attention_backend = "auto"
+        dsa_kernel_backend = "tilelang"
+
+    fake_backend = SimpleNamespace()
+    imported = []
+
+    def fake_import_module(module_name):
+        imported.append(module_name)
+        return fake_backend
+
+    monkeypatch.setattr(dsa_kernels, "import_module", fake_import_module)
+    monkeypatch.setattr(dsa_kernels, "_BACKEND", None)
+    monkeypatch.setattr(dsa_kernels, "_BACKEND_SELECTION", None)
+
+    assert dsa_kernels._load_backend(Config) is fake_backend
+    assert dsa_kernels._load_backend(Config) is fake_backend
+    assert imported == [
+        "megatron.core.transformer.experimental_attention_variant.dsa_tilelang_kernels"
+    ]
+
+    Config.dsa_kernel_backend = "none"
+    assert dsa_kernels._load_backend(Config) is None
+    assert dsa_kernels._BACKEND is None
+    assert dsa_kernels._BACKEND_SELECTION is None
+
+    Config.dsa_kernel_backend = "cudnn"
+
+    def fail_import_module(_module_name):
+        raise OSError("missing backend")
+
+    monkeypatch.setattr(dsa_kernels, "import_module", fail_import_module)
+    with pytest.raises(RuntimeError, match="Failed to import DSA kernel backend"):
+        dsa_kernels._load_backend(Config)
+
+
+def test_dsa_kernel_hooks_return_none_without_backend_function(monkeypatch):
+    class Config:
+        attention_backend = "auto"
+        dsa_kernel_backend = "none"
+
+    q = torch.zeros((1, 1, 1, 1))
+    k = torch.zeros((1, 1, 1, 1))
+    starts = torch.tensor([0], dtype=torch.int32)
+    ends = torch.tensor([1], dtype=torch.int32)
+    topk_indices = torch.zeros((1, 1, 1), dtype=torch.int32)
+
+    assert dsa_kernels.run_fused_qk_topk(Config, q, k, q[..., 0], 1, starts, ends, 128) is None
+    assert (
+        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, k, topk_indices, 1.0, 1) is None
+    )
+
+    monkeypatch.setattr(dsa_kernels, "_load_backend", lambda _config: SimpleNamespace())
+    Config.dsa_kernel_backend = "tilelang"
+    assert dsa_kernels.run_fused_qk_topk(Config, q, k, q[..., 0], 1, starts, ends, 128) is None
+    assert (
+        dsa_kernels.run_fused_qk_topk_with_loss(
+            Config, q, k, q[..., 0], 1, starts, ends, 128, q, k, 1.0, 0.01, object()
+        )
+        is None
+    )
+    assert (
+        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, k, topk_indices, 1.0, 1) is None
+    )
+    assert (
+        dsa_kernels.run_fused_dsa_attention(
+            config=Config,
+            query=q,
+            key=k,
+            value=None,
+            up_v_weight=None,
+            q_indexer=q,
+            k_indexer=k[..., 0],
+            indexer_weights=q[..., 0],
+            indexer_topk=1,
+            softmax_scale=1.0,
+            loss_coeff=0.0,
+            sparse_loss=False,
+            calculate_per_token_loss=False,
+            absorbed_mla=True,
+            cp_size=1,
+            attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=None,
+            varlen_starts=None,
+            varlen_ends=None,
+            key_positions=None,
+            query_valid_rows=None,
+            use_relu=True,
+        )
+        is None
+    )
+
+
+def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
+    class Config:
+        attention_backend = "auto"
+        dsa_kernel_backend = "tilelang"
+
+    q = torch.zeros((1, 1, 1, 1))
+    k = torch.ones((1, 1, 1, 1))
+    starts = torch.tensor([0], dtype=torch.int32)
+    ends = torch.tensor([1], dtype=torch.int32)
+    topk_indices = torch.zeros((1, 1, 1), dtype=torch.int32)
+    expected_topk = (topk_indices, None)
+    expected_topk_loss = (topk_indices, None, torch.tensor(1.0))
+    expected_sparse = torch.ones((1, 1, 1, 1))
+    expected_full = (expected_sparse, torch.tensor(0.0))
+    seen = {}
+
+    def run_fused_qk_topk(*args):
+        seen["topk_args"] = args
+        return expected_topk
+
+    def run_fused_qk_topk_with_loss(**kwargs):
+        seen["loss_kwargs"] = kwargs
+        return expected_topk_loss
+
+    def run_fused_absorbed_sparse_attention(*args):
+        seen["sparse_args"] = args
+        return expected_sparse
+
+    def run_fused_dsa_attention(**kwargs):
+        seen["full_kwargs"] = kwargs
+        return expected_full
+
+    monkeypatch.setattr(
+        dsa_kernels,
+        "_load_backend",
+        lambda _config: SimpleNamespace(
+            run_fused_qk_topk=run_fused_qk_topk,
+            run_fused_qk_topk_with_loss=run_fused_qk_topk_with_loss,
+            run_fused_absorbed_sparse_attention=run_fused_absorbed_sparse_attention,
+            run_fused_dsa_attention=run_fused_dsa_attention,
+        ),
+    )
+
+    assert (
+        dsa_kernels.run_fused_qk_topk(Config, q, k, q[..., 0], 1, starts, ends, 128)
+        is expected_topk
+    )
+    assert seen["topk_args"][-1] is False
+    assert (
+        dsa_kernels.run_fused_qk_topk_with_loss(
+            Config,
+            q,
+            k,
+            q[..., 0],
+            1,
+            starts,
+            ends,
+            128,
+            q,
+            k,
+            1.0,
+            0.01,
+            object(),
+            calculate_per_token_loss=True,
+            use_local_indexer_varlen=True,
+        )
+        is expected_topk_loss
+    )
+    assert seen["loss_kwargs"]["config"] is Config
+    assert seen["loss_kwargs"]["calculate_per_token_loss"] is True
+    assert seen["loss_kwargs"]["use_local_indexer_varlen"] is True
+
+    topk_length = torch.ones((1, 1), dtype=torch.int32)
+    assert (
+        dsa_kernels.run_fused_absorbed_sparse_attention(
+            Config, q, k, topk_indices, 1.0, 1, topk_length
+        )
+        is expected_sparse
+    )
+    assert seen["sparse_args"][-1] is topk_length
+
+    assert (
+        dsa_kernels.run_fused_dsa_attention(
+            config=Config,
+            query=q,
+            key=k,
+            value=None,
+            up_v_weight=None,
+            q_indexer=q,
+            k_indexer=k[..., 0],
+            indexer_weights=q[..., 0],
+            indexer_topk=1,
+            softmax_scale=1.0,
+            loss_coeff=0.0,
+            sparse_loss=False,
+            calculate_per_token_loss=False,
+            absorbed_mla=True,
+            cp_size=1,
+            attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=None,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=None,
+            query_valid_rows=None,
+            use_relu=False,
+            use_local_indexer_varlen=True,
+        )
+        is expected_full
+    )
+    assert seen["full_kwargs"]["varlen_starts"] is starts
+    assert seen["full_kwargs"]["use_relu"] is False
+
+
+def test_dsa_kernel_dependency_validation(monkeypatch):
+    from megatron.core import utils as core_utils
+
+    core_utils._validate_dsa_kernel_backend_dependencies("none")
+    with pytest.raises(ValueError, match="dsa_kernel_backend"):
+        core_utils._validate_dsa_kernel_backend_dependencies("invalid")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        core_utils._validate_dsa_kernel_backend_dependencies("tilelang")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        core_utils, "_missing_tilelang_dsa_kernel_dependencies", lambda: ["TileLang SparseMLA"]
+    )
+    with pytest.raises(ValueError, match="TileLang SparseMLA"):
+        core_utils._validate_dsa_kernel_backend_dependencies("tilelang")
+
+    monkeypatch.setattr(core_utils, "_missing_tilelang_dsa_kernel_dependencies", lambda: [])
+    core_utils._validate_dsa_kernel_backend_dependencies("tilelang")
+
+    monkeypatch.setattr(core_utils, "_missing_cudnn_dsa_kernel_dependencies", lambda: ["flash_mla"])
+    with pytest.raises(ValueError, match="flash_mla"):
+        core_utils._validate_dsa_kernel_backend_dependencies("cudnn")
 
 
 class TestDSACPPositionHelpers:
