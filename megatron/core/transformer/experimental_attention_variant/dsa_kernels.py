@@ -183,6 +183,7 @@ def run_fused_dsa_attention(
     query_valid_rows: Optional[Tensor],
     use_relu: bool,
     use_local_indexer_varlen: bool = False,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Optional full fused DSA hook for backends that fuse indexer and attention together."""
     backend = _load_backend(config)
@@ -215,6 +216,7 @@ def run_fused_dsa_attention(
         query_valid_rows=query_valid_rows,
         use_relu=use_relu,
         use_local_indexer_varlen=use_local_indexer_varlen,
+        pg_collection=pg_collection,
     )
 
 

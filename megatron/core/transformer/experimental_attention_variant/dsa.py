@@ -1907,6 +1907,7 @@ class DSAttention(MegatronModule):
                 query_valid_rows=query_valid_rows,
                 use_relu=self.config.dsa_indexer_scoring_relu,
                 use_local_indexer_varlen=use_local_indexer_varlen,
+                pg_collection=self.pg_collection,
             )
         if fused_output is not None:
             output, indexer_loss = fused_output
