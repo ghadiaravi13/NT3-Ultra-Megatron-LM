@@ -2364,6 +2364,81 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
     return batch
 
 
+def _merge_cu_seqlens_across_micro_batch(cu_seqlens: torch.Tensor, seq_length: int) -> torch.Tensor:
+    """Merge per-sample cu_seqlens into one 1-D tensor for THD attention.
+
+    When micro_batch_size > 1, the dataloader produces cu_seqlens with shape
+    (micro_batch_size, num_segments + 1).  THD / FlashAttention expects a
+    single 1-D cu_seqlens covering all tokens.  This function offsets each
+    sample's cu_seqlens by ``sample_index * seq_length`` and concatenates
+    them, dropping the leading zero of every sample after the first.
+
+    When micro_batch_size == 1, returns ``cu_seqlens[0]`` unchanged.
+
+    Args:
+        cu_seqlens: int32 tensor of shape ``(micro_batch_size, S+1)`` where
+            each row starts at 0 and ends at ``seq_length``.
+        seq_length: per-sample sequence length used to compute offsets.
+
+    Returns:
+        1-D int32 tensor of merged cumulative sequence lengths.
+    """
+    micro_batch_size = cu_seqlens.shape[0]
+    if micro_batch_size == 1:
+        return cu_seqlens[0]
+
+    parts = [cu_seqlens[0]]
+    for i in range(1, micro_batch_size):
+        offset = i * seq_length
+        parts.append(cu_seqlens[i, 1:] + offset)
+    return torch.cat(parts)
+
+
+def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a multi-sample batch into a single packed sequence for THD attention.
+
+    When ``micro_batch_size > 1`` and ``cu_seqlens`` is present, THD /
+    FlashAttention still expects one flat token stream with a single 1-D
+    ``cu_seqlens``.  This function merges ``cu_seqlens`` (and
+    ``cu_seqlens_padded`` if present) across samples, reshapes
+    sequence-dimension tensors from ``(mbs, seq_len)`` to
+    ``(1, mbs * seq_len)``, and reduces ``max_seqlen`` to its maximum.
+
+    When ``cu_seqlens`` is absent or ``micro_batch_size == 1``, the batch
+    is returned with only the batch dimension squeezed from ``cu_seqlens``
+    (and ``cu_seqlens_padded``).
+
+    Args:
+        batch: Batch dict produced by ``get_batch_on_this_tp_rank``.
+
+    Returns:
+        The batch dict with packed-sequence tensors flattened.
+    """
+    cu_seqlens = batch.get('cu_seqlens')
+    if cu_seqlens is None:
+        return batch
+
+    seq_length = None
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        if batch.get(key) is not None:
+            seq_length = batch[key].shape[1]
+            break
+
+    batch['cu_seqlens'] = _merge_cu_seqlens_across_micro_batch(cu_seqlens, seq_length)
+    if batch.get('cu_seqlens_padded') is not None:
+        batch['cu_seqlens_padded'] = _merge_cu_seqlens_across_micro_batch(
+            batch['cu_seqlens_padded'], seq_length
+        )
+    if batch.get('max_seqlen') is not None:
+        batch['max_seqlen'] = batch['max_seqlen'].max(keepdim=True)
+
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        if batch.get(key) is not None:
+            batch[key] = batch[key].reshape(1, -1)
+
+    return batch
+
+
 def get_batch_on_this_cp_rank(
     batch: Dict[str, Any],
     is_hybrid_cp: bool,
