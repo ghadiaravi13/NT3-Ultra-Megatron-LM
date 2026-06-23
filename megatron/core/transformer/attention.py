@@ -440,6 +440,9 @@ class Attention(MegatronModule, ABC):
             core_attention_extra_kwargs = {}
         tensor_kwarg_names = []
         checkpoint_inputs = [query, key, value, attention_mask, rotary_pos_emb, attn_mask_type]
+        # Tensor kwargs used by custom core attention modules, such as DSA's x/qr inputs, must
+        # be passed through checkpoint so recompute sees detached checkpoint inputs instead of
+        # closing over the original forward tensors.
         for name, kwarg_value in core_attention_extra_kwargs.items():
             if torch.is_tensor(kwarg_value):
                 tensor_kwarg_names.append(name)
@@ -469,6 +472,8 @@ class Attention(MegatronModule, ABC):
 
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
+        # Megatron's checkpoint wrapper saves only tensor args, so encode the mask enum as a
+        # tensor here and convert it back to AttnMaskType inside custom_forward.
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
         checkpoint_inputs[5] = attn_mask_type
         hidden_states = tensor_parallel.checkpoint(custom_forward, False, *checkpoint_inputs)
