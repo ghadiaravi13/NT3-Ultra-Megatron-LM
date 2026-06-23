@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import mpu
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.utils import flatten_batch_for_packed_sequences
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from pretrain_hybrid import get_batch
@@ -339,6 +340,77 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert 0 < max_seqlen.item() <= seq_length
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [16, 1024])
+def test_flatten_batch_for_packed_sequences(micro_batch_size, seq_length):
+    """Verify that flatten_batch_for_packed_sequences correctly merges
+    cu_seqlens across samples and flattens sequence-dimension tensors.
+    """
+    # Each sample: tokens = range(seq_length), two documents per sample.
+    tokens = (
+        torch.arange(seq_length, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(micro_batch_size, -1)
+        .clone()
+    )
+    labels = tokens.clone()
+    loss_mask = torch.ones(micro_batch_size, seq_length, dtype=torch.float32)
+    position_ids = (
+        torch.arange(seq_length, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(micro_batch_size, -1)
+        .clone()
+    )
+    half = seq_length // 2
+    cu_seqlens = torch.tensor([[0, half, seq_length]] * micro_batch_size, dtype=torch.int32)
+    max_seqlen = torch.tensor([half] * micro_batch_size, dtype=torch.int32)
+
+    batch = {
+        'tokens': tokens,
+        'labels': labels,
+        'loss_mask': loss_mask,
+        'position_ids': position_ids,
+        'cu_seqlens': cu_seqlens,
+        'max_seqlen': max_seqlen,
+    }
+    result = flatten_batch_for_packed_sequences(batch)
+
+    total_tokens = micro_batch_size * seq_length
+
+    # Sequence-dimension tensors are flattened to (1, mbs * seq_length).
+    assert result['tokens'].shape == (1, total_tokens)
+    assert result['labels'].shape == (1, total_tokens)
+    assert result['loss_mask'].shape == (1, total_tokens)
+    assert result['position_ids'].shape == (1, total_tokens)
+
+    # cu_seqlens is 1-D, starts at 0, ends at total_tokens.
+    assert result['cu_seqlens'].dim() == 1
+    assert result['cu_seqlens'][0].item() == 0
+    assert result['cu_seqlens'][-1].item() == total_tokens
+
+    # Each sample contributes 3 cu_seqlens entries; the first sample's
+    # leading zero is kept while subsequent samples' leading zeros are
+    # dropped, so total entries = 3 + (mbs - 1) * 2.
+    expected_entries = 3 + (micro_batch_size - 1) * 2
+    assert result['cu_seqlens'].shape[0] == expected_entries
+
+    # Verify offsets: sample i's boundaries are offset by i * seq_length.
+    for i in range(micro_batch_size):
+        offset = i * seq_length
+        if i == 0:
+            assert result['cu_seqlens'][0].item() == 0
+            assert result['cu_seqlens'][1].item() == half
+            assert result['cu_seqlens'][2].item() == seq_length
+        else:
+            base = 3 + (i - 1) * 2
+            assert result['cu_seqlens'][base].item() == offset + half
+            assert result['cu_seqlens'][base + 1].item() == offset + seq_length
+
+    # max_seqlen is reduced to a single value.
+    assert result['max_seqlen'].numel() == 1
+    assert result['max_seqlen'].item() == half
 
 
 def create_pretrain_data_iterator(
