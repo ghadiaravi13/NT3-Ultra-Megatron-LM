@@ -413,6 +413,47 @@ def test_flatten_batch_for_packed_sequences(micro_batch_size, seq_length):
     assert result['max_seqlen'].item() == half
 
 
+@pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [16, 1024])
+def test_flatten_batch_for_packed_sequences_intermediate_pp_stage(micro_batch_size, seq_length):
+    """On intermediate PP stages, tokens/labels/loss_mask/position_ids are None.
+    seq_length should be inferred from cu_seqlens[0, -1].
+    """
+    half = seq_length // 2
+    cu_seqlens = torch.tensor([[0, half, seq_length]] * micro_batch_size, dtype=torch.int32)
+    max_seqlen = torch.tensor([half] * micro_batch_size, dtype=torch.int32)
+
+    batch = {
+        'tokens': None,
+        'labels': None,
+        'loss_mask': None,
+        'position_ids': None,
+        'cu_seqlens': cu_seqlens,
+        'max_seqlen': max_seqlen,
+    }
+    result = flatten_batch_for_packed_sequences(batch)
+
+    total_tokens = micro_batch_size * seq_length
+
+    # cu_seqlens is 1-D, starts at 0, ends at total_tokens.
+    assert result['cu_seqlens'].dim() == 1
+    assert result['cu_seqlens'][0].item() == 0
+    assert result['cu_seqlens'][-1].item() == total_tokens
+
+    expected_entries = 3 + (micro_batch_size - 1) * 2
+    assert result['cu_seqlens'].shape[0] == expected_entries
+
+    # max_seqlen is reduced to a single value.
+    assert result['max_seqlen'].numel() == 1
+    assert result['max_seqlen'].item() == half
+
+    # Sequence-dimension tensors remain None.
+    assert result['tokens'] is None
+    assert result['labels'] is None
+    assert result['loss_mask'] is None
+    assert result['position_ids'] is None
+
+
 def create_pretrain_data_iterator(
     seq_length: int = 1024, micro_batch_size: int = 1, create_attention_mask: bool = False
 ):

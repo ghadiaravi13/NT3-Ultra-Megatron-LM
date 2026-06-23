@@ -2423,6 +2423,8 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
         if batch.get(key) is not None:
             seq_length = batch[key].shape[1]
             break
+    if seq_length is None:
+        seq_length = cu_seqlens[0, -1].item()
 
     batch['cu_seqlens'] = _merge_cu_seqlens_across_micro_batch(cu_seqlens, seq_length)
     if batch.get('cu_seqlens_padded') is not None:
