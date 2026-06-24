@@ -449,14 +449,10 @@ class Attention(MegatronModule, ABC):
                 checkpoint_inputs.append(kwarg_value)
 
         def custom_forward(*inputs):
-            query = inputs[0]
-            key = inputs[1]
-            value = inputs[2]
-            attention_mask = inputs[3]
-            attn_mask_type = inputs[5]
+            (query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values) = inputs
             attn_mask_type = AttnMaskType(attn_mask_type.item())
             extra_kwargs = dict(core_attention_extra_kwargs)
-            for name, kwarg_value in zip(tensor_kwarg_names, inputs[6:]):
+            for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
                 extra_kwargs[name] = kwarg_value
             output_ = self._run_core_attention(
                 query,
