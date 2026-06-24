@@ -2430,7 +2430,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
             batch['cu_seqlens_padded'], seq_length
         )
     if batch.get('max_seqlen') is not None:
-        batch['max_seqlen'] = batch['max_seqlen'].max(keepdim=True)
+        batch['max_seqlen'] = batch['max_seqlen'].max().unsqueeze(0)
 
     for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
         if batch.get(key) is not None:
