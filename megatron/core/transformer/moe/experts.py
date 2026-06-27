@@ -320,30 +320,60 @@ class TEGroupedMLP(MegatronModule):
     def _is_fused_impl_supported(self) -> bool:
         """Check if the TE op fuser supports implementing this module."""
 
+        def _unsupported(reason: str) -> bool:
+            # NOTE(rghadia): temporary diagnostic patch to surface which gate
+            # rejects the fused impl. Safe to revert once root-caused.
+            try:
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            except Exception:
+                rank = 0
+            if rank == 0:
+                print(
+                    f"[FusedGroupedMLP][rank0] _is_fused_impl_supported() -> False: {reason}",
+                    flush=True,
+                )
+            return False
+
         # Check Transformer Engine installation
         if not HAVE_TE:
-            return False  # Transformer Engine is not available
+            return _unsupported("HAVE_TE is False (Transformer Engine not available)")
         try:
-            from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
-        except ImportError:
-            return False  # Transformer Engine version is too old
+            from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
+        except ImportError as e:
+            return _unsupported(
+                f"import GroupedLinear/ScaledSwiGLU from transformer_engine.pytorch.ops failed: {e}"
+            )
 
         if not is_te_min_version("2.14.0"):
-            return False
+            try:
+                import transformer_engine as _te_pkg
+                _te_ver = getattr(_te_pkg, "__version__", "<unknown>")
+            except Exception:
+                _te_ver = "<unknown>"
+            return _unsupported(f"is_te_min_version('2.14.0') is False; TE version={_te_ver}")
 
         # Check for unsupported features
         if self.tp_group.size() > 1:
-            return False  # Tensor parallelism is not supported
+            return _unsupported(f"tp_group.size()={self.tp_group.size()} > 1")
         if getattr(self, "offload_expert_fc1", False) or getattr(self, "offload_moe_act", False):
-            return False  # Selective expert_fc1/moe_act offload is only supported unfused.
+            return _unsupported(
+                f"offload_expert_fc1={getattr(self, 'offload_expert_fc1', False)}, "
+                f"offload_moe_act={getattr(self, 'offload_moe_act', False)}"
+            )
         if self.config.moe_apply_probs_on_input:
-            return False  # Pre-multiplying probs is not supported
+            return _unsupported("moe_apply_probs_on_input is True")
 
         # Check grouped linear modules
         if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):
-            return False
+            return _unsupported(
+                f"linear_fc1 is {type(self.linear_fc1).__module__}."
+                f"{type(self.linear_fc1).__name__}, not te.pytorch.GroupedLinear"
+            )
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
-            return False
+            return _unsupported(
+                f"linear_fc2 is {type(self.linear_fc2).__module__}."
+                f"{type(self.linear_fc2).__name__}, not te.pytorch.GroupedLinear"
+            )
 
         # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
         # Use config.activation_func instead of self.activation_func because when
@@ -358,23 +388,31 @@ class TEGroupedMLP(MegatronModule):
             and not self.config.gated_linear_unit
         )
         if not (use_glu_fusion or use_srelu_fusion):
-            return False
+            return _unsupported(
+                f"activation gate failed: activation_func={getattr(self.config.activation_func, '__name__', self.config.activation_func)}, "
+                f"gated_linear_unit={self.config.gated_linear_unit}, "
+                f"use_fused_weighted_squared_relu={self.config.use_fused_weighted_squared_relu}"
+            )
         if self.config.activation_func == F.silu:
             return True
         if self.config.activation_func == quick_gelu:
             try:
                 from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
-            except ImportError:
-                return False
+            except ImportError as e:
+                return _unsupported(
+                    f"import ScaledClampedQGeGLU from transformer_engine.pytorch.ops failed: {e}"
+                )
             return True
         if self.config.activation_func == squared_relu:
             try:
                 from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
-            except ImportError:
-                return False
+            except ImportError as e:
+                return _unsupported(
+                    f"import ScaledSReLU from transformer_engine.pytorch.ops failed: {e}"
+                )
             return True
 
-        return False
+        return _unsupported("fell through all activation branches (unexpected)")
 
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
