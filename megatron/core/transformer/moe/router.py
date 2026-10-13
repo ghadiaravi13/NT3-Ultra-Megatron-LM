@@ -605,6 +605,13 @@ class TopKRouter(Router):
         # local_num_tokens is per-sequence (bsz is folded into the expert dim above) and floors
         # uneven padding, so per-token-loss scaling uses the physical valid-token count instead.
         num_valid_tokens = routing_map.sum() // self.topk if with_padding_mask else seq_length * bsz
+        # Without padding, every rank in the static reduce groups holds seq_length * bsz tokens, so
+        # the reduced count is known on the host and needs no per-layer device reduction. Runtime
+        # CP ranks can hold different counts, so they keep the device reduction.
+        static_topology = packed_seq_params is None or packed_seq_params.local_cp_size is None
+        aux_loss_scale_num_tokens = (
+            total_num_tokens * bsz if static_topology and not with_padding_mask else None
+        )
 
         aux_loss = (
             switch_load_balancing_loss_func(
@@ -630,6 +637,7 @@ class TopKRouter(Router):
             valid_token_count=num_valid_tokens,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
+            aux_loss_scale_num_tokens=aux_loss_scale_num_tokens,
         )
         return probs
 
@@ -791,8 +799,10 @@ class TopKRouter(Router):
                         device=activation.device
                     )
                 else:
-                    aux_loss_scale_num_tokens = torch.tensor(
-                        num_local_tokens, device=activation.device
+                    # torch.tensor would copy from pageable host memory, which blocks the host
+                    # until the stream drains and cannot be captured in a CUDA graph.
+                    aux_loss_scale_num_tokens = torch.full(
+                        (), num_local_tokens, dtype=torch.long, device=activation.device
                     )
                 if aux_loss_scale_reduce_groups is None:
                     assert reduce_group is not None, "reduce_group is required for aux-loss scaling"

@@ -356,7 +356,7 @@ def test_token_count_reduction_keeps_local_count_with_in_place_reduce(monkeypatc
     assert total_tokens == 3
 
 
-def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
+def _seq_aux_loss_attach_kwargs(monkeypatch, *, packed_seq_params=None, with_padding_mask=False):
     router = TopKRouter.__new__(TopKRouter)
     object.__setattr__(router, "topk", 2)
     object.__setattr__(
@@ -396,10 +396,114 @@ def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
     batch_size = 2
     probs = torch.zeros(seq_length * batch_size, 2)
     routing_map = torch.zeros(seq_length * batch_size, 2, dtype=torch.bool)
-    router._apply_seq_aux_loss(probs, probs, routing_map, seq_length=seq_length, bsz=batch_size)
+    router._apply_seq_aux_loss(
+        probs,
+        probs,
+        routing_map,
+        seq_length=seq_length,
+        bsz=batch_size,
+        with_padding_mask=with_padding_mask,
+        packed_seq_params=packed_seq_params,
+    )
+    return captured
+
+
+def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
+    captured = _seq_aux_loss_attach_kwargs(monkeypatch)
 
     assert captured["valid_token_count"] == 10
-    assert "aux_loss_scale_num_tokens" not in captured
+    # The per-sequence count reduced over two ranks (10) times bsz, resolved on the host.
+    assert captured["aux_loss_scale_num_tokens"] == 20
+
+
+@pytest.mark.parametrize(
+    "runtime_cp, with_padding_mask", [(True, False), (False, True)], ids=["runtime_cp", "padding"]
+)
+def test_seq_aux_loss_reduces_scale_on_device_when_counts_vary(
+    monkeypatch, runtime_cp, with_padding_mask
+):
+    packed_seq_params = (
+        PackedSeqParams(qkv_format="thd", local_cp_size=2, cp_group=_ProcessGroup(2))
+        if runtime_cp
+        else None
+    )
+    captured = _seq_aux_loss_attach_kwargs(
+        monkeypatch, packed_seq_params=packed_seq_params, with_padding_mask=with_padding_mask
+    )
+
+    assert captured["aux_loss_scale_num_tokens"] is None
+
+
+def _per_token_loss_router(monkeypatch):
+    router = TopKRouter.__new__(TopKRouter)
+    object.__setattr__(router, "calculate_per_token_loss", True)
+    object.__setattr__(router, "is_mtp_layer", False)
+    object.__setattr__(router, "layer_number", 1)
+    object.__setattr__(
+        router,
+        "config",
+        SimpleNamespace(num_layers=2, mtp_num_layers=None, mtp_use_repeated_layer=False),
+    )
+    monkeypatch.setattr(
+        router_mod,
+        "get_moe_metrics_tracker",
+        lambda: SimpleNamespace(record=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+    return router
+
+
+def _per_token_aux_loss_grad(router, **kwargs):
+    activation = torch.zeros(1, requires_grad=True)
+    aux_source = torch.tensor(3.0, requires_grad=True)
+    output = router.attach_and_log_load_balancing_loss(
+        activation,
+        aux_loss_coeff=1.0,
+        aux_loss=aux_source.square(),
+        aux_loss_name="per_token_scale_test",
+        reduce_group=None,
+        needs_dp_avg=False,
+        **kwargs,
+    )
+    output.sum().backward()
+    return aux_source.grad
+
+
+def test_per_token_aux_loss_host_scale_skips_device_reduction(monkeypatch):
+    router = _per_token_loss_router(monkeypatch)
+
+    def _unexpected_all_reduce(*_args, **_kwargs):
+        raise AssertionError("a host-side token count must not be reduced on device")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", _unexpected_all_reduce)
+
+    grad = _per_token_aux_loss_grad(
+        router,
+        valid_token_count=10,
+        aux_loss_scale_reduce_groups=(_ProcessGroup(2),),
+        aux_loss_scale_num_tokens=20,
+    )
+
+    torch.testing.assert_close(grad, torch.tensor(2 * 3.0 * 20))
+
+
+def test_per_token_aux_loss_reduces_int_count_on_device(monkeypatch):
+    router = _per_token_loss_router(monkeypatch)
+    group = _ProcessGroup(2)
+    reduced = []
+
+    def _fake_all_reduce(tensor, group=None):
+        reduced.append((tensor.dtype, group))
+        tensor.mul_(group.size())
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", _fake_all_reduce)
+
+    grad = _per_token_aux_loss_grad(
+        router, valid_token_count=3, aux_loss_scale_reduce_groups=(group,)
+    )
+
+    assert reduced == [(torch.long, group)]
+    torch.testing.assert_close(grad, torch.tensor(2 * 3.0 * 6))
 
 
 class TestDynamicCPRouterDistributed:
